@@ -1,0 +1,301 @@
+use kauri_ledger::app::build_router;
+use axum::{
+    body::Body,
+    http::{
+        Method, Request, StatusCode,
+        header::{ALLOW, CONTENT_TYPE},
+    },
+};
+use http_body_util::BodyExt;
+use serde_json::Value;
+use tower::ServiceExt;
+
+/// Sends a GET request to the router and decodes the JSON response.
+async fn get_json(uri: &str) -> (StatusCode, String, Value) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = build_router().oneshot(request).await.unwrap();
+
+    let status = response.status();
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let json = serde_json::from_slice(&body).unwrap();
+
+    (status, content_type, json)
+}
+
+async fn get_response(
+    uri: &str,
+    request_id: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("GET").uri(uri);
+
+    if let Some(request_id) = request_id {
+        builder = builder.header("x-request-id", request_id);
+    }
+
+    let request = builder.body(Body::empty()).unwrap();
+
+    build_router().oneshot(request).await.unwrap()
+}
+
+async fn send_request(
+    method: Method,
+    uri: &str,
+    request_id: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+
+    if let Some(request_id) = request_id {
+        builder = builder.header("x-request-id", request_id);
+    }
+
+    let request = builder.body(Body::empty()).unwrap();
+
+    build_router().oneshot(request).await.unwrap()
+}
+
+#[tokio::test]
+async fn hello_returns_a_json_message() {
+    let (status, content_type, body) = get_json("/hello").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(body["message"], "Hello World!");
+}
+
+#[tokio::test]
+async fn health_returns_a_healthy_response() {
+    let (status, content_type, body) = get_json("/health").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "application/json");
+    assert_eq!(body["is_healthy"], true);
+    assert_eq!(body["status"], 200);
+}
+
+#[tokio::test]
+async fn openapi_document_contains_the_application_endpoints() {
+    let (status, content_type, body) =
+        get_json("/api-docs/openapi.json").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "application/json");
+
+    assert!(body["paths"]["/hello"]["get"].is_object());
+    assert!(body["paths"]["/health"]["get"].is_object());
+
+    assert!(
+        body["components"]["schemas"]["MessageResponse"].is_object()
+    );
+
+    assert!(
+        body["components"]["schemas"]["HealthResponse"].is_object()
+    );
+    assert!(
+    body["components"]["schemas"]["ErrorResponse"].is_object()
+);
+
+assert!(
+    body["components"]["schemas"]["ErrorBody"].is_object()
+);
+}
+
+#[tokio::test]
+async fn swagger_ui_returns_the_html_interface() {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/swagger-ui/")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = build_router().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    assert!(content_type.starts_with("text/html"));
+}
+
+#[tokio::test]
+async fn existing_request_id_is_propagated_to_the_response() {
+    let response =
+        get_response("/hello", Some("test-request-123")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "test-request-123"
+    );
+}
+
+#[tokio::test]
+async fn missing_request_id_is_generated() {
+    let response = get_response("/hello", None).await;
+
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id should be present");
+
+    assert!(!request_id.is_empty());
+    assert!(request_id.to_str().is_ok());
+}
+
+#[tokio::test]
+async fn different_requests_receive_different_request_ids() {
+    let first = get_response("/hello", None).await;
+    let second = get_response("/hello", None).await;
+
+    let first_id = first.headers().get("x-request-id").unwrap();
+    let second_id = second.headers().get("x-request-id").unwrap();
+
+    assert_ne!(first_id, second_id);
+}
+
+#[tokio::test]
+async fn unknown_routes_also_receive_a_request_id() {
+    let response =
+        get_response("/route-that-does-not-exist", None).await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response
+            .headers()
+            .get("x-request-id")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn unknown_route_returns_a_json_error_with_the_same_request_id() {
+    let response = send_request(
+        Method::GET,
+        "/route-that-does-not-exist",
+        Some("error-request-123"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "error-request-123"
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["error"]["code"], "not_found");
+    assert_eq!(
+        json["error"]["message"],
+        "The requested resource was not found"
+    );
+    assert_eq!(
+        json["error"]["request_id"],
+        "error-request-123"
+    );
+}
+
+#[tokio::test]
+async fn generated_request_id_matches_the_error_body() {
+    let response = send_request(
+        Method::GET,
+        "/route-that-does-not-exist",
+        None,
+    )
+    .await;
+
+    let header_request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json["error"]["request_id"].as_str(),
+        Some(header_request_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn wrong_method_returns_a_json_405_and_preserves_allow() {
+    let response = send_request(
+        Method::POST,
+        "/hello",
+        Some("method-request-123"),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+
+  // Axum's Allow header must be preserved.
+    assert!(response.headers().contains_key(ALLOW));
+
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "method-request-123"
+    );
+
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["error"]["code"], "method_not_allowed");
+    assert_eq!(
+        json["error"]["request_id"],
+        "method-request-123"
+    );
+}
