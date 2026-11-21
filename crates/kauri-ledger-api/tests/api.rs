@@ -1,4 +1,4 @@
-use kauri_ledger::app::build_router;
+use kauri_ledger_api::app::build_router;
 use axum::{
     body::Body,
     http::{
@@ -184,7 +184,7 @@ async fn unknown_routes_also_receive_a_request_id() {
     assert!(
         response
             .headers()
-            .get("x-request-id")
+            .getkauri_ledger_api("x-request-id")
             .is_some()
     );
 }

@@ -1,4 +1,4 @@
-use kauri_ledger::error::{AppError, normalize_errors};
+use kauri_ledger_api::error::{AppError, normalize_errors};
 use axum::{
     Router,
     body::Body,
