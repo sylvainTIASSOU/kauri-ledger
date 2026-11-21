@@ -1,0 +1,16 @@
+[package]
+name = "kauri-ledger-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kauri-cli"
+path = "src/main.rs"
+
+[dependencies]
+kauri-ledger-core = { path = "../kauri-ledger-core" }
+kauri-ledger-store = { path = "../kauri-ledger-store" }
+
+clap = { version = "4.6.9", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["full"] }

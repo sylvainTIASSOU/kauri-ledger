@@ -1,0 +1,13 @@
+[package]
+name = "kauri-ledger-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kauri-ledger-core = { path = "../kauri-ledger-core" }
+
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }
+uuid = { version = "1.29.3", features = ["v7", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+thiserror = "2.0.21"

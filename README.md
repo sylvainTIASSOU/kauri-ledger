@@ -1,162 +1,24 @@
-# kauri-ledger
+# 🌳 Kauri Ledger
 
-An Axum application generated with
-[Axum Forge](https://github.com/sylvainTIASSOU/axum-forge).
+An open-source, reliable, and auditable double-entry accounting engine, specifically designed for the realities of West Africa (UEMOA, XOF, Mobile Money, unstable networks).
 
-## Requirements
+> **Status**: Phase 0 (Scoping). Foundation laid.  
+> **Note**: The API boilerplate was efficiently generated using [cargo-axum-forge](https://crates.io/crates/cargo-axum-forge).
 
-- a stable Rust toolchain with Rust 2024 edition support;
-- [watchexec](https://github.com/watchexec/watchexec), only if you want to
-  use the optional `cargo dev` command.
+## Why?
+Most applications handle money using a simple "balance" column in a database. This inevitably leads to duplicate charges, half-failed operations, and disputes that are impossible to audit. Kauri Ledger enforces double-entry bookkeeping, immutability, and idempotence to guarantee that **every Franc is traceable**.
 
-Axum Forge is not required to build, test, or run this application.
+## Core Principles
+- **Double-Entry**: Every transaction is balanced (Total Debits = Total Credits).
+- **Immutability**: Nothing is ever deleted. Errors are corrected via reversing entries.
+- **Idempotence**: A request sent twice produces exactly one ledger entry.
+- **XOF Native**: Amounts are strictly integers (no floats, no cents).
 
-## Quick start
+## Project Structure (Cargo Workspace)
+- `kauri-ledger-core`: Pure domain logic (types, rules, invariants). No I/O.
+- `kauri-ledger-store`: PostgreSQL persistence layer using `sqlx`.
+- `kauri-ledger-api`: HTTP REST API built with `axum` and `utoipa` (OpenAPI).
+- `kauri-ledger-cli`: Command-line tools for migrations and integrity checks.
 
-Create a local configuration file:
-
-```bash
-cp .env.example .env
-```
-
-Start the server:
-
-```bash
-cargo run
-```
-
-Available endpoints:
-
-| Endpoint | Description |
-|---|---|
-| `GET /hello` | Returns a greeting message |
-| `GET /health` | Returns the application health status |
-| `GET /swagger-ui/` | Opens Swagger UI |
-| `GET /api-docs/openapi.json` | Returns the OpenAPI document |
-
-With the default configuration, Swagger UI is available at:
-
-```text
-http://127.0.0.1:3030/swagger-ui/
-```
-
-## Configuration
-
-| Variable | Default | Description |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Address on which the server listens |
-| `PORT` | `3030` | TCP port used by the server |
-| `RUST_LOG` | `info` | Tracing filter, such as `info`, `debug`, or `trace` |
-| `LOG_FORMAT` | `json` | Log format: `json` or `pretty` |
-
-The provided `.env.example` contains:
-
-```dotenv
-HOST=0.0.0.0
-PORT=3030
-RUST_LOG=info
-LOG_FORMAT=pretty
-```
-
-`HOST=0.0.0.0` is a listening address. For local browser access, use
-`127.0.0.1`.
-
-## Logging
-
-Use colored, human-readable logs during development:
-
-```bash
-LOG_FORMAT=pretty RUST_LOG=info cargo run
-```
-
-Use structured JSON logs for production or log collectors:
-
-```bash
-LOG_FORMAT=json RUST_LOG=info cargo run
-```
-
-HTTP logs contain the request ID, method, matched route, direct peer IP,
-response status, and latency.
-
-The application does not log request bodies, cookies, authorization headers,
-or query strings. `X-Forwarded-For` is not trusted automatically.
-
-## Request IDs
-
-The server preserves an incoming `x-request-id` or generates one when it is
-missing:
-
-```bash
-curl -i \
-  -H 'x-request-id: demo-123' \
-  http://127.0.0.1:3030/hello
-```
-
-The same identifier is included in the response headers and HTTP logs.
-
-## Error responses
-
-Errors are returned as JSON:
-
-```json
-{
-  "error": {
-    "code": "not_found",
-    "message": "The requested resource was not found",
-    "request_id": "demo-123"
-  }
-}
-```
-
-For example:
-
-```bash
-curl -i \
-  -H 'x-request-id: demo-123' \
-  http://127.0.0.1:3030/unknown-route
-```
-
-Standard error codes include:
-
-- `bad_request` for HTTP `400`;
-- `not_found` for HTTP `404`;
-- `method_not_allowed` for HTTP `405`;
-- `internal_server_error` for HTTP `500`.
-
-Internal errors always use a generic public message. Sensitive
-implementation details must not be returned to the client.
-
-## Development with automatic restart
-
-Install watchexec once:
-
-```bash
-cargo install watchexec-cli --locked
-```
-
-Then run:
-
-```bash
-cargo dev
-```
-
-When a Rust source file or `Cargo.toml` changes, the application is rebuilt
-and restarted automatically.
-
-This is an automatic restart, not state-preserving hot reload.
-
-## Tests and checks
-
-Run all tests:
-
-```bash
-cargo test --all-targets
-```
-
-Run the formatting, compilation, and Clippy checks:
-
-```bash
-cargo fmt --all -- --check
-cargo check --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-```
+## Next Steps
+See the [Architecture Decision Records](docs/adr/) and the [Roadmap](docs/guides/roadmap.md).
