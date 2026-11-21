@@ -1,3 +1,6 @@
-//! PostgreSQL persistence layer for the Kauri Ledger.
+//! PostgreSQL persistence layer for Kauri Ledger.
 
-// pub mod repository; // we will implement this in phase 1B
+pub mod models;
+// pub mod repository; // Will be implemented in Phase 1B.2
+
+pub use models::{DbAccount, DbBalance, DbEntry, DbTransaction};
