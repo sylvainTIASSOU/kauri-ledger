@@ -1,2 +1,2 @@
-pub mod hello;
 pub mod health;
+pub mod hello;

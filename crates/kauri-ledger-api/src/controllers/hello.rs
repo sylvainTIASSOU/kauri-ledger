@@ -22,4 +22,3 @@ pub async fn hello_handler() -> (StatusCode, Json<MessageResponse>) {
         }),
     )
 }
-

@@ -1,4 +1,3 @@
-use kauri_ledger_api::app::build_router;
 use axum::{
     body::Body,
     http::{
@@ -7,6 +6,7 @@ use axum::{
     },
 };
 use http_body_util::BodyExt;
+use kauri_ledger_api::app::build_router;
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -29,22 +29,14 @@ async fn get_json(uri: &str) -> (StatusCode, String, Value) {
         .unwrap_or_default()
         .to_string();
 
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
 
     let json = serde_json::from_slice(&body).unwrap();
 
     (status, content_type, json)
 }
 
-async fn get_response(
-    uri: &str,
-    request_id: Option<&str>,
-) -> axum::response::Response {
+async fn get_response(uri: &str, request_id: Option<&str>) -> axum::response::Response {
     let mut builder = Request::builder().method("GET").uri(uri);
 
     if let Some(request_id) = request_id {
@@ -93,8 +85,7 @@ async fn health_returns_a_healthy_response() {
 
 #[tokio::test]
 async fn openapi_document_contains_the_application_endpoints() {
-    let (status, content_type, body) =
-        get_json("/api-docs/openapi.json").await;
+    let (status, content_type, body) = get_json("/api-docs/openapi.json").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(content_type, "application/json");
@@ -102,20 +93,12 @@ async fn openapi_document_contains_the_application_endpoints() {
     assert!(body["paths"]["/hello"]["get"].is_object());
     assert!(body["paths"]["/health"]["get"].is_object());
 
-    assert!(
-        body["components"]["schemas"]["MessageResponse"].is_object()
-    );
+    assert!(body["components"]["schemas"]["MessageResponse"].is_object());
 
-    assert!(
-        body["components"]["schemas"]["HealthResponse"].is_object()
-    );
-    assert!(
-    body["components"]["schemas"]["ErrorResponse"].is_object()
-);
+    assert!(body["components"]["schemas"]["HealthResponse"].is_object());
+    assert!(body["components"]["schemas"]["ErrorResponse"].is_object());
 
-assert!(
-    body["components"]["schemas"]["ErrorBody"].is_object()
-);
+    assert!(body["components"]["schemas"]["ErrorBody"].is_object());
 }
 
 #[tokio::test]
@@ -141,8 +124,7 @@ async fn swagger_ui_returns_the_html_interface() {
 
 #[tokio::test]
 async fn existing_request_id_is_propagated_to_the_response() {
-    let response =
-        get_response("/hello", Some("test-request-123")).await;
+    let response = get_response("/hello", Some("test-request-123")).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -177,16 +159,10 @@ async fn different_requests_receive_different_request_ids() {
 
 #[tokio::test]
 async fn unknown_routes_also_receive_a_request_id() {
-    let response =
-        get_response("/route-that-does-not-exist", None).await;
+    let response = get_response("/route-that-does-not-exist", None).await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert!(
-        response
-            .headers()
-            .getkauri_ledger_api("x-request-id")
-            .is_some()
-    );
+    assert!(response.headers().get("x-request-id").is_some());
 }
 
 #[tokio::test]
@@ -210,12 +186,7 @@ async fn unknown_route_returns_a_json_error_with_the_same_request_id() {
         "error-request-123"
     );
 
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
 
     let json: Value = serde_json::from_slice(&body).unwrap();
 
@@ -224,20 +195,12 @@ async fn unknown_route_returns_a_json_error_with_the_same_request_id() {
         json["error"]["message"],
         "The requested resource was not found"
     );
-    assert_eq!(
-        json["error"]["request_id"],
-        "error-request-123"
-    );
+    assert_eq!(json["error"]["request_id"], "error-request-123");
 }
 
 #[tokio::test]
 async fn generated_request_id_matches_the_error_body() {
-    let response = send_request(
-        Method::GET,
-        "/route-that-does-not-exist",
-        None,
-    )
-    .await;
+    let response = send_request(Method::GET, "/route-that-does-not-exist", None).await;
 
     let header_request_id = response
         .headers()
@@ -247,12 +210,7 @@ async fn generated_request_id_matches_the_error_body() {
         .unwrap()
         .to_owned();
 
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
 
     let json: Value = serde_json::from_slice(&body).unwrap();
 
@@ -264,19 +222,11 @@ async fn generated_request_id_matches_the_error_body() {
 
 #[tokio::test]
 async fn wrong_method_returns_a_json_405_and_preserves_allow() {
-    let response = send_request(
-        Method::POST,
-        "/hello",
-        Some("method-request-123"),
-    )
-    .await;
+    let response = send_request(Method::POST, "/hello", Some("method-request-123")).await;
 
-    assert_eq!(
-        response.status(),
-        StatusCode::METHOD_NOT_ALLOWED
-    );
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 
-  // Axum's Allow header must be preserved.
+    // Axum's Allow header must be preserved.
     assert!(response.headers().contains_key(ALLOW));
 
     assert_eq!(
@@ -284,18 +234,10 @@ async fn wrong_method_returns_a_json_405_and_preserves_allow() {
         "method-request-123"
     );
 
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
 
     let json: Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(json["error"]["code"], "method_not_allowed");
-    assert_eq!(
-        json["error"]["request_id"],
-        "method-request-123"
-    );
+    assert_eq!(json["error"]["request_id"], "method-request-123");
 }
