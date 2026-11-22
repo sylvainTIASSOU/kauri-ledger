@@ -8,6 +8,20 @@ fn get_cli_binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_kauri-cli")
 }
 
+async fn initialize_test_database(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../ops/postgres/bootstrap_roles.sql"
+    )))
+    .execute(pool)
+    .await
+    .expect("Failed to provision test security roles");
+
+    run_migrations(pool)
+        .await
+        .expect("Failed to run migrations");
+}
+
 #[tokio::test]
 async fn test_cli_verify_integrity_success() {
     let container = Postgres::default().start().await.unwrap();
@@ -16,7 +30,7 @@ async fn test_cli_verify_integrity_success() {
     let database_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
 
     let pool = create_pool(&database_url).await.unwrap();
-    run_migrations(&pool).await.unwrap();
+    initialize_test_database(&pool).await;
 
     let asset_code = AccountCode::new("asset:cash").unwrap();
     let liability_code = AccountCode::new("liability:debt").unwrap();
@@ -77,7 +91,7 @@ async fn test_cli_verify_all_accounts() {
     let database_url = format!("postgres://postgres:postgres@{}:{}/postgres", host, port);
 
     let pool = create_pool(&database_url).await.unwrap();
-    run_migrations(&pool).await.unwrap();
+    initialize_test_database(&pool).await;
 
     let asset_code = AccountCode::new("asset:cash").unwrap();
     let liability_code = AccountCode::new("liability:debt").unwrap();

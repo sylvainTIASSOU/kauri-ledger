@@ -31,6 +31,14 @@ impl TestDb {
             .await
             .expect("Failed to create pool");
 
+        sqlx::raw_sql(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../ops/postgres/bootstrap_roles.sql"
+        )))
+        .execute(&pool)
+        .await
+        .expect("Failed to provision test security roles");
+
         run_migrations(&pool)
             .await
             .expect("Failed to run migrations");
