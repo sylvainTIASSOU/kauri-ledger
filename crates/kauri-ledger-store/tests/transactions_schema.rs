@@ -624,3 +624,279 @@ async fn rejects_mutation_and_truncation_of_posted_data() {
         assert_sqlstate(error, "23514");
     }
 }
+
+fn current_second() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0)
+        .expect("Current timestamp must be valid")
+}
+
+fn assert_rule_violation(error: sqlx::Error, marker: &str) {
+    match &error {
+        sqlx::Error::Database(database_error) => {
+            assert!(
+                database_error.message().contains(marker),
+                "Expected error marker {marker}, got: {}",
+                database_error.message()
+            );
+        }
+        other => panic!("Expected a PostgreSQL error, got: {other:?}"),
+    }
+
+    assert_sqlstate(error, "23514");
+}
+
+async fn attempt_new_transaction(
+    pool: &PgPool,
+    ledger_id: Uuid,
+    key: &str,
+    effective_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO ledger.transactions \
+         (ledger_id, id, route_scope, idempotency_key, \
+          request_hash, response_snapshot, response_body, \
+          effective_at) \
+         VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6, $7)",
+    )
+    .bind(ledger_id)
+    .bind(Uuid::now_v7())
+    .bind("POST /transactions")
+    .bind(key)
+    .bind(vec![7_u8; 32])
+    .bind(b"{}".to_vec())
+    .bind(effective_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn close_period(pool: &PgPool, ledger_id: Uuid, cutoff: DateTime<Utc>) {
+    sqlx::query("SELECT ledger.close_period($1, $2)")
+        .bind(ledger_id)
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn frozen_ledger_rejects_new_transactions() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, credit_id) = create_accounts(&db.pool).await;
+
+    sqlx::query(
+        "UPDATE ledger.ledgers \
+         SET status = 'frozen' WHERE id = $1",
+    )
+    .bind(ledger_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let error = attempt_new_transaction(&db.pool, ledger_id, "frozen-ledger-key-001", Utc::now())
+        .await
+        .expect_err("Frozen ledgers must reject postings");
+
+    assert_rule_violation(error, "LEDGER_FROZEN");
+
+    // Administrative reactivation allows new postings.
+    sqlx::query(
+        "UPDATE ledger.ledgers \
+         SET status = 'active' WHERE id = $1",
+    )
+    .bind(ledger_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    post(
+        &db.pool,
+        ledger_id,
+        debit_id,
+        credit_id,
+        "POST /transactions",
+        "reactivated-ledger-001",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn closed_period_rejects_backdated_and_boundary_postings() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, credit_id) = create_accounts(&db.pool).await;
+
+    let cutoff = current_second();
+    close_period(&db.pool, ledger_id, cutoff).await;
+
+    for (key, effective_at) in [
+        (
+            "backdated-posting-001",
+            cutoff - chrono::Duration::seconds(1),
+        ),
+        ("boundary-posting-001", cutoff),
+    ] {
+        let error = attempt_new_transaction(&db.pool, ledger_id, key, effective_at)
+            .await
+            .expect_err("Closed periods must reject postings");
+
+        assert_rule_violation(error, "PERIOD_LOCKED");
+    }
+
+    // A new transaction after the cutoff remains valid.
+    post(
+        &db.pool,
+        ledger_id,
+        debit_id,
+        credit_id,
+        "POST /transactions",
+        "post-closure-key-001",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn period_closure_cannot_move_backward() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, _, _) = create_accounts(&db.pool).await;
+
+    let cutoff = current_second();
+
+    close_period(&db.pool, ledger_id, cutoff).await;
+
+    let error = sqlx::query("SELECT ledger.close_period($1, $2)")
+        .bind(ledger_id)
+        .bind(cutoff - chrono::Duration::seconds(1))
+        .execute(&db.pool)
+        .await
+        .expect_err("Period closures must be monotonic");
+
+    assert_rule_violation(error, "PERIOD_LOCK_REWIND");
+
+    // Repeating the same cutoff is idempotent.
+    close_period(&db.pool, ledger_id, cutoff).await;
+
+    let actual_cutoff: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT locked_until FROM ledger.period_locks \
+         WHERE ledger_id = $1",
+    )
+    .bind(ledger_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(actual_cutoff, cutoff);
+}
+
+#[tokio::test]
+async fn posting_prevents_concurrent_freeze_from_overtaking() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, _, _) = create_accounts(&db.pool).await;
+
+    let mut posting = db.pool.begin().await.unwrap();
+
+    insert_transaction(
+        &mut posting,
+        ledger_id,
+        Uuid::now_v7(),
+        "POST /transactions",
+        "inflight-freeze-test-001",
+        Utc::now(),
+        None,
+    )
+    .await;
+
+    let mut administrative = db.pool.begin().await.unwrap();
+
+    sqlx::query("SET LOCAL lock_timeout = '150ms'")
+        .execute(&mut *administrative)
+        .await
+        .unwrap();
+
+    let error = sqlx::query(
+        "UPDATE ledger.ledgers \
+         SET status = 'frozen' WHERE id = $1",
+    )
+    .bind(ledger_id)
+    .execute(&mut *administrative)
+    .await
+    .expect_err("Freeze must wait for the in-flight posting");
+
+    assert_sqlstate(error, "55P03");
+
+    administrative.rollback().await.unwrap();
+    posting.rollback().await.unwrap();
+
+    // After the posting ends, freezing succeeds.
+    sqlx::query(
+        "UPDATE ledger.ledgers \
+         SET status = 'frozen' WHERE id = $1",
+    )
+    .bind(ledger_id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let status: String = sqlx::query_scalar("SELECT status FROM ledger.ledgers WHERE id = $1")
+        .bind(ledger_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(status, "frozen");
+}
+
+#[tokio::test]
+async fn posting_prevents_concurrent_period_closure() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, _, _) = create_accounts(&db.pool).await;
+
+    let mut posting = db.pool.begin().await.unwrap();
+
+    insert_transaction(
+        &mut posting,
+        ledger_id,
+        Uuid::now_v7(),
+        "POST /transactions",
+        "inflight-period-test-001",
+        Utc::now(),
+        None,
+    )
+    .await;
+
+    let mut administrative = db.pool.begin().await.unwrap();
+
+    sqlx::query("SET LOCAL lock_timeout = '150ms'")
+        .execute(&mut *administrative)
+        .await
+        .unwrap();
+
+    let cutoff = current_second();
+
+    let error = sqlx::query("SELECT ledger.close_period($1, $2)")
+        .bind(ledger_id)
+        .bind(cutoff)
+        .execute(&mut *administrative)
+        .await
+        .expect_err("Period closure must wait for the posting");
+
+    assert_sqlstate(error, "55P03");
+
+    administrative.rollback().await.unwrap();
+    posting.rollback().await.unwrap();
+
+    // The period can be closed after the posting ends.
+    close_period(&db.pool, ledger_id, cutoff).await;
+
+    let actual_cutoff: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT locked_until FROM ledger.period_locks \
+         WHERE ledger_id = $1",
+    )
+    .bind(ledger_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(actual_cutoff, cutoff);
+}
