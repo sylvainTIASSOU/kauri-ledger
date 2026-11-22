@@ -90,10 +90,7 @@ impl IntoResponse for AppError {
     }
 }
 
-pub async fn normalize_errors(
-    request: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn normalize_errors(request: Request<Body>, next: Next) -> Response {
     let request_id = request
         .headers()
         .get("x-request-id")
@@ -111,9 +108,7 @@ pub async fn normalize_errors(
     let (code, message) = response
         .extensions()
         .get::<AppError>()
-        .map(|error| {
-            (error.code.to_owned(), error.message.clone())
-        })
+        .map(|error| (error.code.to_owned(), error.message.clone()))
         .unwrap_or_else(|| default_error(status));
 
     let error_response = ErrorResponse::new(code, message, request_id);
@@ -121,38 +116,25 @@ pub async fn normalize_errors(
     // We keep the status and headers of the original response, notably Allow for 405 responses.
     let (mut parts, _) = response.into_parts();
 
-    parts.headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
+    parts
+        .headers
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
     // the old body is replaced with a new JSON body.
     parts.headers.remove(CONTENT_LENGTH);
 
-    Response::from_parts(
-        parts,
-        Json(error_response).into_response().into_body(),
-    )
+    Response::from_parts(parts, Json(error_response).into_response().into_body())
 }
 
 fn default_error(status: StatusCode) -> (String, String) {
     let (code, message) = match status {
-        StatusCode::BAD_REQUEST => (
-            "bad_request",
-            "The request is invalid",
-        ),
-        StatusCode::NOT_FOUND => (
-            "not_found",
-            "The requested resource was not found",
-        ),
+        StatusCode::BAD_REQUEST => ("bad_request", "The request is invalid"),
+        StatusCode::NOT_FOUND => ("not_found", "The requested resource was not found"),
         StatusCode::METHOD_NOT_ALLOWED => (
             "method_not_allowed",
             "The HTTP method is not allowed for this resource",
         ),
-        _ if status.is_server_error() => (
-            "internal_server_error",
-            "An unexpected error occurred",
-        ),
+        _ if status.is_server_error() => ("internal_server_error", "An unexpected error occurred"),
         _ => (
             "http_error",
             status.canonical_reason().unwrap_or("HTTP error"),
@@ -170,10 +152,7 @@ mod tests {
     fn internal_errors_do_not_expose_implementation_details() {
         let error = AppError::internal();
 
-        assert_eq!(
-            error.status,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.code, "internal_server_error");
         assert_eq!(error.message, "An unexpected error occurred");
     }
@@ -183,9 +162,6 @@ mod tests {
         let (code, message) = default_error(StatusCode::NOT_FOUND);
 
         assert_eq!(code, "not_found");
-        assert_eq!(
-            message,
-            "The requested resource was not found"
-        );
+        assert_eq!(message, "The requested resource was not found");
     }
 }

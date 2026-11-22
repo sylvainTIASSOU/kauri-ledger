@@ -1,25 +1,18 @@
-use kauri_ledger::error::{AppError, normalize_errors};
 use axum::{
     Router,
     body::Body,
-    http::{
-        HeaderName, Request, StatusCode,
-        header::CONTENT_TYPE,
-    },
+    http::{HeaderName, Request, StatusCode, header::CONTENT_TYPE},
     middleware::from_fn,
     routing::get,
 };
 use http_body_util::BodyExt;
+use kauri_ledger_api::error::{AppError, normalize_errors};
 use serde_json::Value;
 use tower::ServiceExt;
-use tower_http::request_id::{
-    MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer,
-};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 
 async fn bad_request_handler() -> Result<(), AppError> {
-    Err(AppError::bad_request(
-        "The `name` field is required",
-    ))
+    Err(AppError::bad_request("The `name` field is required"))
 }
 
 async fn internal_error_handler() -> Result<(), AppError> {
@@ -33,19 +26,11 @@ fn error_test_router() -> Router {
         .route("/test-bad-request", get(bad_request_handler))
         .route("/test-internal-error", get(internal_error_handler))
         .layer(from_fn(normalize_errors))
-        .layer(PropagateRequestIdLayer::new(
-            request_id_header.clone(),
-        ))
-        .layer(SetRequestIdLayer::new(
-            request_id_header,
-            MakeRequestUuid,
-        ))
+        .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
 }
 
-async fn get_error(
-    uri: &str,
-    request_id: &str,
-) -> (StatusCode, String, String, Value) {
+async fn get_error(uri: &str, request_id: &str) -> (StatusCode, String, String, Value) {
     let request = Request::builder()
         .method("GET")
         .uri(uri)
@@ -53,10 +38,7 @@ async fn get_error(
         .body(Body::empty())
         .unwrap();
 
-    let response = error_test_router()
-        .oneshot(request)
-        .await
-        .unwrap();
+    let response = error_test_router().oneshot(request).await.unwrap();
 
     let status = response.status();
 
@@ -74,12 +56,7 @@ async fn get_error(
         .unwrap_or_default()
         .to_owned();
 
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
 
     let json = serde_json::from_slice(&body).unwrap();
 
@@ -96,14 +73,8 @@ async fn app_bad_request_returns_a_public_json_error() {
     assert_eq!(response_request_id, "bad-request-123");
 
     assert_eq!(body["error"]["code"], "bad_request");
-    assert_eq!(
-        body["error"]["message"],
-        "The `name` field is required"
-    );
-    assert_eq!(
-        body["error"]["request_id"],
-        "bad-request-123"
-    );
+    assert_eq!(body["error"]["message"], "The `name` field is required");
+    assert_eq!(body["error"]["request_id"], "bad-request-123");
 }
 
 #[tokio::test]
@@ -111,23 +82,11 @@ async fn app_internal_error_returns_a_generic_json_error() {
     let (status, content_type, response_request_id, body) =
         get_error("/test-internal-error", "internal-error-123").await;
 
-    assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(content_type, "application/json");
     assert_eq!(response_request_id, "internal-error-123");
 
-    assert_eq!(
-        body["error"]["code"],
-        "internal_server_error"
-    );
-    assert_eq!(
-        body["error"]["message"],
-        "An unexpected error occurred"
-    );
-    assert_eq!(
-        body["error"]["request_id"],
-        "internal-error-123"
-    );
+    assert_eq!(body["error"]["code"], "internal_server_error");
+    assert_eq!(body["error"]["message"], "An unexpected error occurred");
+    assert_eq!(body["error"]["request_id"], "internal-error-123");
 }

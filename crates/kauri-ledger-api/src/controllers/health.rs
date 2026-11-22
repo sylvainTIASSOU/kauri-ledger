@@ -1,7 +1,6 @@
 use crate::models::message::HealthResponse;
 use axum::{Json, debug_handler, http::StatusCode};
 
-
 #[debug_handler]
 #[utoipa::path(
     get,
