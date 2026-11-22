@@ -1,6 +1,6 @@
 //! Core domain logic for the Kauri Ledger.
 //! No I/O, no database, no network dependencies.
-
+#![forbid(unsafe_code)]
 pub mod account;
 pub mod amount;
 pub mod balance;

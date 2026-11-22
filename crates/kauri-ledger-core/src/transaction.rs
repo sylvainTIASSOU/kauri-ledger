@@ -1,11 +1,11 @@
 use crate::amount::Amount;
 use crate::entry::{Direction, Entry};
 use crate::error::LedgerError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 /// A transaction that is guaranteed to be balanced upon creation.
 /// It is immutable and cannot be constructed if the invariants are violated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BalancedTransaction {
     entries: Vec<Entry>,
 }
@@ -48,6 +48,23 @@ impl BalancedTransaction {
     /// Returns a reference to the entries.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnvalidatedTransaction {
+    entries: Vec<Entry>,
+}
+
+impl<'de> Deserialize<'de> for BalancedTransaction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = UnvalidatedTransaction::deserialize(deserializer)?;
+
+        Self::new(raw.entries).map_err(D::Error::custom)
     }
 }
 

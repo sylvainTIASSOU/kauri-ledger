@@ -1,11 +1,11 @@
 use crate::error::LedgerError;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 /// Represents a monetary amount in whole XOF currency units (Francs CFA).
 /// No floating-point numbers are used to avoid rounding errors.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Default)]
 pub struct Amount(i64);
 
 impl Amount {
@@ -41,5 +41,16 @@ impl Amount {
     /// Returns true if the amount is zero.
     pub fn is_zero(&self) -> bool {
         self.0 == 0
+    }
+}
+
+impl<'de> Deserialize<'de> for Amount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = i64::deserialize(deserializer)?;
+
+        Self::new(value).map_err(D::Error::custom)
     }
 }

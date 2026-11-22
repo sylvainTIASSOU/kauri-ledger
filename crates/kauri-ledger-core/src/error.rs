@@ -17,6 +17,6 @@ pub enum LedgerError {
     #[error("OVERFLOW: Arithmetic operation resulted in an overflow")]
     Overflow,
 
-    #[error("INVALID_ACCOUNT_CODE: Account code connot be empty")]
+    #[error("INVALID_ACCOUNT_CODE: Account code does not match the required format")]
     InvalidAccountCode,
 }
