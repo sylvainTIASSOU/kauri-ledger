@@ -1427,6 +1427,9 @@ dependencies = [
  "clap",
  "kauri-ledger-core",
  "kauri-ledger-store",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
 ]
 

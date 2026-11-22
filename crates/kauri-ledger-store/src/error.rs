@@ -19,6 +19,15 @@ pub enum StoreError {
 
     #[error("MIGRATION_ERROR: {0}")]
     MigrationError(#[from] sqlx::migrate::MigrateError),
+
+    #[error(
+        "BALANCE_INTEGRITY_ERROR: Account '{account_code}' has stored balance {stored} but actual calculated balance is {actual}"
+    )]
+    BalanceIntegrityError {
+        account_code: String,
+        stored: i64,
+        actual: i64,
+    },
 }
 
 /// Checks if a sqlx::Error is a PostgreSql deadlock (SQLSTATE 40P01)

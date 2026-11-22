@@ -267,3 +267,65 @@ pub async fn get_account_history(
     .await?;
     Ok(entries)
 }
+
+/// Calculates the actual balance of an account by summing all its entries.
+/// This is used for integrity verification.
+pub async fn calculate_actual_balance(
+    pool: &PgPool,
+    code: &AccountCode,
+) -> Result<i64, StoreError> {
+    let result: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT COALESCE(SUM(
+            CASE
+                WHEN direction = 'Debit' THEN amount
+                ELSE -amount
+            END
+        ), 0)::BIGINT
+        FROM entries
+        WHERE account_code = $1
+        "#,
+    )
+    .bind(code.as_str())
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(result.map(|(sum,)| sum).unwrap_or(0))
+}
+
+/// Verifies the integrity of an account's balance.
+/// Returns Ok(()) if the stored balance matches the calculated balance.
+/// Returns Err if there's a mismatch.
+pub async fn verify_account_balance_integrity(
+    pool: &PgPool,
+    code: &AccountCode,
+) -> Result<(), StoreError> {
+    let stored_balance = get_balance(pool, code).await?;
+    let actual_balance = calculate_actual_balance(pool, code).await?;
+
+    match stored_balance {
+        Some(db_balance) => {
+            if db_balance.balance != actual_balance {
+                Err(StoreError::BalanceIntegrityError {
+                    account_code: code.as_str().to_string(),
+                    stored: db_balance.balance,
+                    actual: actual_balance,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        None => {
+            // If no balance row exists but there are entries, that's an integrity error
+            if actual_balance != 0 {
+                Err(StoreError::BalanceIntegrityError {
+                    account_code: code.as_str().to_string(),
+                    stored: 0,
+                    actual: actual_balance,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
