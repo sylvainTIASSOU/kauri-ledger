@@ -13,4 +13,4 @@ pub use amount::Amount;
 pub use balance::calculate_balance_delta;
 pub use entry::{Direction, Entry};
 pub use error::LedgerError;
-pub use transaction::BalancedTransaction;
+pub use transaction::{BalancedTransaction, MAX_ENTRY_AMOUNT, MAX_TRANSACTION_ENTRIES};

@@ -3,6 +3,12 @@ use crate::entry::{Direction, Entry};
 use crate::error::LedgerError;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
+/// Maximum amount alloawed for a single ledger entry.
+pub const MAX_ENTRY_AMOUNT: i64 = 1_000_000_000_000;
+
+/// Maximum number of entries allowed in a transaction.
+pub const MAX_TRANSACTION_ENTRIES: usize = 64;
+
 /// A transaction that is guaranteed to be balanced upon creation.
 /// It is immutable and cannot be constructed if the invariants are violated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -22,12 +28,20 @@ impl BalancedTransaction {
             return Err(LedgerError::InsufficientEntries);
         }
 
+        if entries.len() > MAX_TRANSACTION_ENTRIES {
+            return Err(LedgerError::TooManyEntries);
+        }
+
         let mut total_debits = Amount::default();
         let mut total_credits = Amount::default();
 
         for entry in &entries {
             if entry.amount.is_zero() {
                 return Err(LedgerError::InvalidAmount);
+            }
+
+            if entry.amount.as_i64() > MAX_ENTRY_AMOUNT {
+                return Err(LedgerError::EntryAmountTooLarge);
             }
 
             match entry.direction {
@@ -89,7 +103,7 @@ mod tests {
 
             let tx = BalancedTransaction::new(entries).unwrap();
 
-            let deltas = calculate_balance_delta(&tx);
+            let deltas = calculate_balance_delta(&tx).unwrap();
             let sum: i64 = deltas.values().sum();
 
             // The sum of all deltas in a balanced transaction must be exactly 0.
@@ -170,8 +184,8 @@ mod tests {
         let reversed_tx = BalancedTransaction::new(reversed_entries).unwrap();
 
         // Calculate deltas
-        let delta1 = calculate_balance_delta(&tx);
-        let delta2 = calculate_balance_delta(&reversed_tx);
+        let delta1 = calculate_balance_delta(&tx).unwrap();
+        let delta2 = calculate_balance_delta(&reversed_tx).unwrap();
 
         // Sum of deltas should be zero for all accounts
         let mut combined = delta1;

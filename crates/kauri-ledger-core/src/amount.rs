@@ -32,6 +32,9 @@ impl Amount {
 
     /// Subtracts two amounts with overflow checking.
     pub fn checked_sub(self, other: Self) -> Result<Self, LedgerError> {
+        if self.0 < other.0 {
+            return Err(LedgerError::AmountUnderflow);
+        }
         self.0
             .checked_sub(other.0)
             .map(Self)
