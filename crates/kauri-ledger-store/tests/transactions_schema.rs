@@ -389,3 +389,238 @@ async fn rejects_invalid_hashes_and_entry_amounts() {
         drop(transaction);
     }
 }
+
+#[tokio::test]
+async fn rejects_transactions_without_enough_entries_at_commit() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, _) = create_accounts(&db.pool).await;
+
+    for (entry_count, key) in [
+        (0_usize, "empty-transaction-001"),
+        (1_usize, "single-entry-001"),
+    ] {
+        let mut transaction = db.pool.begin().await.unwrap();
+        let transaction_id = Uuid::now_v7();
+        let effective_at = Utc::now();
+
+        insert_transaction(
+            &mut transaction,
+            ledger_id,
+            transaction_id,
+            "POST /transactions",
+            key,
+            effective_at,
+            None,
+        )
+        .await;
+
+        if entry_count == 1 {
+            sqlx::query(
+                "INSERT INTO ledger.entries \
+                 (ledger_id, transaction_id, account_id, \
+                  side, amount, effective_at) \
+                 VALUES ($1, $2, $3, 'D', 100, $4)",
+            )
+            .bind(ledger_id)
+            .bind(transaction_id)
+            .bind(debit_id)
+            .bind(effective_at)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+
+        let error = transaction
+            .commit()
+            .await
+            .expect_err("Incomplete transactions must not commit");
+
+        assert_sqlstate(error, "23514");
+    }
+}
+
+#[tokio::test]
+async fn rejects_unbalanced_transactions_at_commit() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, credit_id) = create_accounts(&db.pool).await;
+
+    let mut transaction = db.pool.begin().await.unwrap();
+    let transaction_id = Uuid::now_v7();
+    let effective_at = Utc::now();
+
+    insert_transaction(
+        &mut transaction,
+        ledger_id,
+        transaction_id,
+        "POST /transactions",
+        "unbalanced-transaction-001",
+        effective_at,
+        None,
+    )
+    .await;
+
+    for (account_id, side, amount) in [(debit_id, "D", 100_i64), (credit_id, "C", 99_i64)] {
+        sqlx::query(
+            "INSERT INTO ledger.entries \
+             (ledger_id, transaction_id, account_id, \
+              side, amount, effective_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(ledger_id)
+        .bind(transaction_id)
+        .bind(account_id)
+        .bind(side)
+        .bind(amount)
+        .bind(effective_at)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    }
+
+    let error = transaction
+        .commit()
+        .await
+        .expect_err("Unbalanced transactions must not commit");
+
+    assert_sqlstate(error, "23514");
+}
+
+#[tokio::test]
+async fn rejects_transactions_with_more_than_64_entries() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, credit_id) = create_accounts(&db.pool).await;
+
+    let mut transaction = db.pool.begin().await.unwrap();
+    let transaction_id = Uuid::now_v7();
+    let effective_at = Utc::now();
+
+    insert_transaction(
+        &mut transaction,
+        ledger_id,
+        transaction_id,
+        "POST /transactions",
+        "too-many-entries-001",
+        effective_at,
+        None,
+    )
+    .await;
+
+    // 33 debit entries and 33 credit entries.
+    // The transaction is balanced but exceeds the entry limit.
+    for _ in 0..33 {
+        for (account_id, side) in [(debit_id, "D"), (credit_id, "C")] {
+            sqlx::query(
+                "INSERT INTO ledger.entries \
+                 (ledger_id, transaction_id, account_id, \
+                  side, amount, effective_at) \
+                 VALUES ($1, $2, $3, $4, 1, $5)",
+            )
+            .bind(ledger_id)
+            .bind(transaction_id)
+            .bind(account_id)
+            .bind(side)
+            .bind(effective_at)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+    }
+
+    let error = transaction
+        .commit()
+        .await
+        .expect_err("Transactions with 66 entries must not commit");
+
+    assert_sqlstate(error, "23514");
+}
+
+#[tokio::test]
+async fn seals_committed_transactions_against_late_entries() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, credit_id) = create_accounts(&db.pool).await;
+
+    let transaction_id = post(
+        &db.pool,
+        ledger_id,
+        debit_id,
+        credit_id,
+        "POST /transactions",
+        "sealed-transaction-001",
+        None,
+    )
+    .await;
+
+    let seal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ledger.transaction_seals \
+         WHERE ledger_id = $1 AND transaction_id = $2",
+    )
+    .bind(ledger_id)
+    .bind(transaction_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(seal_count, 1);
+
+    let effective_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT effective_at FROM ledger.transactions \
+             WHERE ledger_id = $1 AND id = $2",
+    )
+    .bind(ledger_id)
+    .bind(transaction_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let error = sqlx::query(
+        "INSERT INTO ledger.entries \
+         (ledger_id, transaction_id, account_id, \
+          side, amount, effective_at) \
+         VALUES ($1, $2, $3, 'D', 100, $4)",
+    )
+    .bind(ledger_id)
+    .bind(transaction_id)
+    .bind(debit_id)
+    .bind(effective_at)
+    .execute(&db.pool)
+    .await
+    .expect_err("Sealed transactions must reject late entries");
+
+    assert_sqlstate(error, "23514");
+}
+
+#[tokio::test]
+async fn rejects_mutation_and_truncation_of_posted_data() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, debit_id, credit_id) = create_accounts(&db.pool).await;
+
+    post(
+        &db.pool,
+        ledger_id,
+        debit_id,
+        credit_id,
+        "POST /transactions",
+        "immutable-transaction-001",
+        None,
+    )
+    .await;
+
+    let invalid_statements = [
+        "UPDATE ledger.transactions SET reference = 'tampered'",
+        "DELETE FROM ledger.transactions",
+        "UPDATE ledger.entries SET amount = 999",
+        "DELETE FROM ledger.entries",
+        "DELETE FROM ledger.transaction_seals",
+        "TRUNCATE ledger.entries",
+        "TRUNCATE ledger.transaction_seals",
+    ];
+
+    for statement in invalid_statements {
+        let error = sqlx::query(statement)
+            .execute(&db.pool)
+            .await
+            .expect_err("Append-only tables must reject mutation");
+
+        assert_sqlstate(error, "23514");
+    }
+}
