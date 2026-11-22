@@ -4,13 +4,8 @@ use std::process::Command;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-fn get_cli_binary_path() -> std::path::PathBuf {
-    // Get the path to the compiled kauri-cli binary
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // Remove the test binary name
-    path.pop(); // Remove "deps"
-    path.push("kauri-cli");
-    path
+fn get_cli_binary_path() -> &'static str {
+    env!("CARGO_BIN_EXE_kauri-cli")
 }
 
 #[tokio::test]
@@ -26,8 +21,12 @@ async fn test_cli_verify_integrity_success() {
     let asset_code = AccountCode::new("asset:cash").unwrap();
     let liability_code = AccountCode::new("liability:debt").unwrap();
 
-    create_account(&pool, &asset_code, AccountType::Asset).await.unwrap();
-    create_account(&pool, &liability_code, AccountType::Liability).await.unwrap();
+    create_account(&pool, &asset_code, AccountType::Asset)
+        .await
+        .unwrap();
+    create_account(&pool, &liability_code, AccountType::Liability)
+        .await
+        .unwrap();
 
     let amount = Amount::new(5000).unwrap();
     let entries = vec![
@@ -40,7 +39,7 @@ async fn test_cli_verify_integrity_success() {
 
     // Run the CLI command using the compiled binary directly
     let cli_path = get_cli_binary_path();
-    let output = Command::new(&cli_path)
+    let output = Command::new(cli_path)
         .args([
             "verify-integrity",
             "--database-url",
@@ -83,8 +82,12 @@ async fn test_cli_verify_all_accounts() {
     let asset_code = AccountCode::new("asset:cash").unwrap();
     let liability_code = AccountCode::new("liability:debt").unwrap();
 
-    create_account(&pool, &asset_code, AccountType::Asset).await.unwrap();
-    create_account(&pool, &liability_code, AccountType::Liability).await.unwrap();
+    create_account(&pool, &asset_code, AccountType::Asset)
+        .await
+        .unwrap();
+    create_account(&pool, &liability_code, AccountType::Liability)
+        .await
+        .unwrap();
 
     let amount = Amount::new(3000).unwrap();
     let entries = vec![
@@ -93,11 +96,13 @@ async fn test_cli_verify_all_accounts() {
     ];
     let tx = BalancedTransaction::new(entries).unwrap();
 
-    record_transaction(&pool, "cli-test-all", &tx).await.unwrap();
+    record_transaction(&pool, "cli-test-all", &tx)
+        .await
+        .unwrap();
 
     // Run the CLI command without specifying an account (verifies all)
     let cli_path = get_cli_binary_path();
-    let output = Command::new(&cli_path)
+    let output = Command::new(cli_path)
         .args(["verify-integrity", "--database-url", &database_url])
         .output()
         .expect("Failed to execute CLI binary");
