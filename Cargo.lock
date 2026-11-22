@@ -1444,6 +1444,7 @@ name = "kauri-ledger-store"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "hex",
  "kauri-ledger-core",
  "sha2",
