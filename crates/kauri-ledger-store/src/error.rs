@@ -1,3 +1,4 @@
+use crate::idempotency::RequestHashError;
 use thiserror::Error;
 
 /// Errors specific to the storage layer.
@@ -28,6 +29,12 @@ pub enum StoreError {
         stored: i64,
         actual: i64,
     },
+
+    #[error("INVALID_ROUTE_SCOPE: invalid tenant posting route")]
+    InvalidRouteScope,
+
+    #[error("INVALID_REQUEST_JSON: {0}")]
+    InvalidRequestJson(#[from] RequestHashError),
 }
 
 /// Checks if a sqlx::Error is a PostgreSql deadlock (SQLSTATE 40P01)

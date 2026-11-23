@@ -4,6 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::StoreError;
+use crate::idempotency::compute_request_hash;
 
 /// An entry referencing an account by its tenant-scoped UUID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,14 +17,16 @@ pub struct TenantLedgerEntry {
 /// Input for a trusted ledger posting operation.
 ///
 /// The caller must provide an authenticated ledger scope,
-/// a canonical request hash, and a valid JSON response body.
+/// The trusted HTTP layer must supply the original route scope
+/// and raw JSON body before applying server-side defaults.
+/// Parsed entries must originate from that same body.
 #[derive(Debug)]
 pub struct TenantPosting<'a> {
     pub ledger_id: Uuid,
     pub transaction_id: Uuid,
     pub route_scope: &'a str,
     pub idempotency_key: &'a str,
-    pub request_hash: [u8; 32],
+    pub raw_request_body: &'a [u8],
     pub response_body: &'a [u8],
     pub effective_at: DateTime<Utc>,
     pub entries: &'a [TenantLedgerEntry],
@@ -86,6 +89,18 @@ pub async fn post_tenant_transaction(
     pool: &PgPool,
     request: &TenantPosting<'_>,
 ) -> Result<TenantPostingResult, StoreError> {
+    // Bind the idempotency scope to the canonical tenant route.
+    let request_path = format!("/v1/ledgers/{}/transactions", request.ledger_id);
+
+    let expected_route_scope = format!("POST {request_path}");
+
+    if request.route_scope != expected_route_scope {
+        return Err(StoreError::InvalidRouteScope);
+    }
+
+    // Hash the original JSON body before applying any defaults.
+    let request_hash = compute_request_hash("POST", &request_path, request.raw_request_body)?;
+
     // Build three parallel arrays from the same validated input.
     let account_ids: Vec<Uuid> = request
         .entries
@@ -150,7 +165,7 @@ pub async fn post_tenant_transaction(
     .bind(request.transaction_id)
     .bind(request.route_scope)
     .bind(request.idempotency_key)
-    .bind(request.request_hash.to_vec())
+    .bind(request_hash.to_vec())
     .bind(request.response_body.to_vec())
     .bind(request.effective_at)
     .bind(account_ids)
