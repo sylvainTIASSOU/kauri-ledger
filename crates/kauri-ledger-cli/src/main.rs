@@ -1,6 +1,9 @@
+mod audit;
+
 use clap::{Parser, Subcommand};
 use kauri_ledger_core::AccountCode;
 use kauri_ledger_store::{create_pool, verify_account_balance_integrity};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "kauri-cli")]
@@ -21,6 +24,20 @@ enum Commands {
         /// Account code to verify (if not provided, verifies all accounts)
         #[arg(short, long)]
         account: Option<String>,
+    },
+    /// Audit the structural and accounting integrity of ledgers.
+    AuditLedger {
+        /// PostgreSQL database URL.
+        #[arg(short, long, env = "DATABASE_URL")]
+        database_url: String,
+
+        /// Target one ledger, or audit all ledgers when omitted.
+        #[arg(long)]
+        ledger: Option<Uuid>,
+
+        /// Output format for the audit report.
+        #[arg(long, value_enum, default_value = "text")]
+        format: audit::AuditFormat,
     },
 }
 
@@ -78,6 +95,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::AuditLedger {
+            database_url,
+            ledger,
+            format,
+        } => {
+            let pool = create_pool(&database_url).await?;
+
+            let exit_code = audit::execute(&pool, ledger, format).await?;
+
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+
+            Ok(())
         }
     }
 }

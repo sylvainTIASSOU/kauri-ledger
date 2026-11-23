@@ -3,7 +3,7 @@ mod common;
 use chrono::Utc;
 use kauri_ledger_core::{AccountCode, AccountType, Amount, Direction};
 use kauri_ledger_store::{
-    integrity::verify_ledger_integrity,
+    integrity::{LedgerStructuralIssue, verify_ledger_integrity},
     tenant_repository::{
         TenantLedgerEntry, TenantPosting, create_ledger_account, post_tenant_transaction,
     },
@@ -50,7 +50,7 @@ async fn create_accounts(pool: &PgPool, ledger_id: Uuid) -> (Uuid, Uuid) {
     (funding_id, wallet_id)
 }
 
-async fn post_funding(pool: &PgPool, ledger_id: Uuid, funding_id: Uuid, wallet_id: Uuid) {
+async fn post_funding(pool: &PgPool, ledger_id: Uuid, funding_id: Uuid, wallet_id: Uuid) -> Uuid {
     let entries = [
         TenantLedgerEntry {
             account_id: wallet_id,
@@ -84,7 +84,10 @@ async fn post_funding(pool: &PgPool, ledger_id: Uuid, funding_id: Uuid, wallet_i
         entries: &entries,
     };
 
-    post_tenant_transaction(pool, &request).await.unwrap();
+    post_tenant_transaction(pool, &request)
+        .await
+        .unwrap()
+        .transaction_id
 }
 
 #[tokio::test]
@@ -273,4 +276,141 @@ async fn nonexistent_ledger_returns_none() {
         .unwrap();
 
     assert!(report.is_none());
+}
+
+/// Simulate database corruption inside an isolated test container.
+///
+/// The PostgreSQL test user is a superuser. This helper must never
+/// be included in production code.
+async fn simulate_corruption(
+    pool: &PgPool,
+    statement: &'static str,
+    ledger_id: Uuid,
+    subject_id: Uuid,
+) {
+    let mut transaction = pool.begin().await.unwrap();
+
+    sqlx::query("SET LOCAL session_replication_role = 'replica'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+    sqlx::query(statement)
+        .bind(ledger_id)
+        .bind(subject_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+    transaction.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn detects_transactions_with_missing_entries() {
+    let db = common::TestDb::new().await;
+    let ledger_id = create_ledger(&db.pool).await;
+
+    let (funding_id, wallet_id) = create_accounts(&db.pool, ledger_id).await;
+
+    let transaction_id = post_funding(&db.pool, ledger_id, funding_id, wallet_id).await;
+
+    simulate_corruption(
+        &db.pool,
+        "DELETE FROM ledger.entries \
+         WHERE ledger_id = $1 AND transaction_id = $2",
+        ledger_id,
+        transaction_id,
+    )
+    .await;
+
+    let report = verify_ledger_integrity(&db.pool, ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!report.is_healthy());
+
+    assert!(report.structural_issues.iter().any(|issue| {
+        matches!(
+            issue,
+            LedgerStructuralIssue::InvalidTransaction {
+                transaction_id: id,
+                entry_count: 0,
+                ..
+            } if *id == transaction_id
+        )
+    }));
+}
+
+#[tokio::test]
+async fn detects_orphan_balances_and_orphan_entries() {
+    let db = common::TestDb::new().await;
+
+    // First ledger: an account is removed while its balance remains.
+    let balance_ledger = create_ledger(&db.pool).await;
+
+    let (_, wallet_id) = create_accounts(&db.pool, balance_ledger).await;
+
+    simulate_corruption(
+        &db.pool,
+        "DELETE FROM ledger.accounts \
+         WHERE ledger_id = $1 AND id = $2",
+        balance_ledger,
+        wallet_id,
+    )
+    .await;
+
+    let balance_report = verify_ledger_integrity(&db.pool, balance_ledger)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!balance_report.is_healthy());
+
+    assert!(balance_report.structural_issues.iter().any(|issue| {
+        matches!(
+            issue,
+            LedgerStructuralIssue::BalanceWithoutAccount {
+                account_id,
+            } if *account_id == wallet_id
+        )
+    }));
+
+    // Second ledger: a posted transaction is removed while
+    // its journal entries and account totals remain.
+    let journal_ledger = create_ledger(&db.pool).await;
+
+    let (funding_id, receiver_id) = create_accounts(&db.pool, journal_ledger).await;
+
+    let transaction_id = post_funding(&db.pool, journal_ledger, funding_id, receiver_id).await;
+
+    simulate_corruption(
+        &db.pool,
+        "DELETE FROM ledger.transactions \
+         WHERE ledger_id = $1 AND id = $2",
+        journal_ledger,
+        transaction_id,
+    )
+    .await;
+
+    let journal_report = verify_ledger_integrity(&db.pool, journal_ledger)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Per-account totals can still agree despite an orphan entry.
+    assert!(journal_report.mismatches.is_empty());
+    assert_eq!(journal_report.stored_net_total, 0);
+    assert_eq!(journal_report.journal_net_total, 0);
+    assert!(!journal_report.is_healthy());
+
+    assert!(journal_report.structural_issues.iter().any(|issue| {
+        matches!(
+            issue,
+            LedgerStructuralIssue::EntryWithoutTransaction {
+                transaction_id: id,
+                ..
+            } if *id == transaction_id
+        )
+    }));
 }

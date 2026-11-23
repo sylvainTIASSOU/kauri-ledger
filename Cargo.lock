@@ -1427,10 +1427,12 @@ dependencies = [
  "clap",
  "kauri-ledger-core",
  "kauri-ledger-store",
+ "serde_json",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
