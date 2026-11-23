@@ -544,3 +544,81 @@ async fn route_scope_must_match_the_target_ledger() {
 
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn lock_timeout_rolls_back_and_allows_a_later_retry() {
+    let db = common::TestDb::new().await;
+    let (ledger_id, funding_id, wallet_id, receiver_id) = setup(&db.pool).await;
+
+    fund_wallet(&db.pool, ledger_id, funding_id, wallet_id).await;
+
+    // Simulate another transaction holding the wallet balance lock.
+    let mut lock_holder = db.pool.begin().await.unwrap();
+
+    let locked_account: Uuid = sqlx::query_scalar(
+        "SELECT account_id \
+         FROM ledger.account_balances \
+         WHERE ledger_id = $1 AND account_id = $2 \
+         FOR UPDATE",
+    )
+    .bind(ledger_id)
+    .bind(wallet_id)
+    .fetch_one(&mut *lock_holder)
+    .await
+    .unwrap();
+
+    assert_eq!(locked_account, wallet_id);
+
+    let spending = [
+        entry(receiver_id, Direction::Debit, 10),
+        entry(wallet_id, Direction::Credit, 10),
+    ];
+
+    // The repository must return a lock timeout rather than
+    // waiting indefinitely for the other transaction.
+    let error = post(
+        &db.pool,
+        ledger_id,
+        "blocked-post-001",
+        20,
+        b"{}",
+        &spending,
+    )
+    .await
+    .expect_err("Posting must respect its lock timeout");
+
+    assert_sqlstate(error, "55P03");
+
+    // The failed posting must not leave any journal entries.
+    let transaction_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ledger.transactions \
+         WHERE ledger_id = $1",
+    )
+    .bind(ledger_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(transaction_count, 1);
+
+    lock_holder.rollback().await.unwrap();
+
+    // After releasing the lock, the original request can succeed.
+    let result = post(
+        &db.pool,
+        ledger_id,
+        "blocked-post-001",
+        20,
+        b"{}",
+        &spending,
+    )
+    .await
+    .unwrap();
+
+    assert!(!result.replayed);
+
+    assert_eq!(
+        wallet_totals(&db.pool, ledger_id, wallet_id).await,
+        (100, 10, 2)
+    );
+}

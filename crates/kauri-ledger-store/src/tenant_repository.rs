@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use kauri_ledger_core::{AccountCode, AccountType, Amount, Direction};
 use sqlx::PgPool;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -12,6 +13,22 @@ pub struct TenantLedgerEntry {
     pub account_id: Uuid,
     pub direction: Direction,
     pub amount: Amount,
+}
+
+const MAX_POST_ATTEMPTS: usize = 3;
+const RETRY_BASE_DELAY_MS: u64 = 25;
+
+fn is_retryable_sqlstate(code: &str) -> bool {
+    matches!(code, "40001" | "40P01")
+}
+
+fn is_retryable_posting_error(error: &StoreError) -> bool {
+    match error {
+        StoreError::Database(sqlx::Error::Database(database_error)) => database_error
+            .code()
+            .is_some_and(|code| is_retryable_sqlstate(code.as_ref())),
+        _ => false,
+    }
 }
 
 /// Input for a trusted ledger posting operation.
@@ -78,6 +95,30 @@ pub async fn create_ledger_account(
     Ok(create_id)
 }
 
+/// Post with bounded retries for transient PostgreSQL failures.
+///
+/// Each attempt starts a new database transaction. Business and
+/// permission errors are never retried.
+pub async fn post_tenant_transaction(
+    pool: &PgPool,
+    request: &TenantPosting<'_>,
+) -> Result<TenantPostingResult, StoreError> {
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+
+        match post_tenant_transaction_once(pool, request).await {
+            Err(error) if attempt < MAX_POST_ATTEMPTS && is_retryable_posting_error(&error) => {
+                let delay_ms = RETRY_BASE_DELAY_MS * (1_u64 << (attempt - 1));
+
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Post a tenant-scoped transaction using the protected SQL function.
 ///
 /// The PostgreSQL function is responsible for idempotency,
@@ -85,7 +126,7 @@ pub async fn create_ledger_account(
 /// deferred balance validation, and transaction sealing.
 ///
 /// This adapter must not be exposed directly to untrusted clients.
-pub async fn post_tenant_transaction(
+async fn post_tenant_transaction_once(
     pool: &PgPool,
     request: &TenantPosting<'_>,
 ) -> Result<TenantPostingResult, StoreError> {
@@ -123,9 +164,20 @@ pub async fn post_tenant_transaction(
         .map(|entry| entry.amount.as_i64())
         .collect();
 
+    // Apply timeouts only to this posting transaction.
+    let mut db_tx = pool.begin().await?;
+
+    sqlx::query("SET LOCAL lock_timeout = '3s'")
+        .execute(&mut *db_tx)
+        .await?;
+
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *db_tx)
+        .await?;
+
     // Construct JSONB on the database side using typed parameters.
     // WITH ORDINALITY preserves the original entry order.
-    let (transaction_id, replayed, response_body): (Uuid, bool, Vec<u8>) = sqlx::query_as(
+    let result: Result<(Uuid, bool, Vec<u8>), sqlx::Error> = sqlx::query_as(
         r#"
         SELECT
             posted_transaction_id,
@@ -171,12 +223,41 @@ pub async fn post_tenant_transaction(
     .bind(account_ids)
     .bind(sides)
     .bind(amounts)
-    .fetch_one(pool)
-    .await?;
+    .fetch_one(&mut *db_tx)
+    .await;
+
+    let (transaction_id, replayed, response_body) = match result {
+        Ok(row) => row,
+        Err(error) => {
+            let _ = db_tx.rollback().await;
+            return Err(StoreError::Database(error));
+        }
+    };
+
+    // Deferred PostgreSQL checks execute before success is returned.
+    db_tx.commit().await?;
 
     Ok(TenantPostingResult {
         transaction_id,
         replayed,
         response_body,
     })
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::is_retryable_sqlstate;
+
+    #[test]
+    fn retries_only_deadlocks_and_serialization_failures() {
+        assert!(is_retryable_sqlstate("40P01"));
+        assert!(is_retryable_sqlstate("40001"));
+
+        for code in ["55P03", "57014", "23514", "23505", "42501"] {
+            assert!(
+                !is_retryable_sqlstate(code),
+                "Unexpected retry for SQLSTATE {code}"
+            );
+        }
+    }
 }
