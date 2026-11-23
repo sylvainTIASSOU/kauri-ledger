@@ -4,6 +4,7 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod repository;
+pub mod tenant_repository;
 
 pub use db::{create_pool, run_migrations};
 pub use error::StoreError;
