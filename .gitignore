@@ -3,3 +3,4 @@
 .env.dev
 /backups/
 /local-secrets/
+docs/Guide_env_config.md
