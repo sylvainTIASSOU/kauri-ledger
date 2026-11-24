@@ -99,6 +99,24 @@ async fn openapi_document_contains_the_application_endpoints() {
     assert!(body["components"]["schemas"]["ErrorResponse"].is_object());
 
     assert!(body["components"]["schemas"]["ErrorBody"].is_object());
+
+    assert!(body["paths"]["/v1/ledgers/{ledger_id}/transactions"]["post"].is_object());
+
+    assert!(body["paths"]["/v1/ledgers/{ledger_id}/accounts/{code}/balance"]["get"].is_object());
+
+    assert!(
+        body["paths"]["/v1/ledgers/{ledger_id}/transactions/{transaction_id}"]["get"].is_object()
+    );
+
+    let bearer = &body["components"]["securitySchemes"]["bearer_auth"];
+
+    assert_eq!(bearer["type"], "http");
+    assert_eq!(bearer["scheme"], "bearer");
+
+    let posting_security =
+        &body["paths"]["/v1/ledgers/{ledger_id}/transactions"]["post"]["security"];
+
+    assert_eq!(posting_security[0]["bearer_auth"], serde_json::json!([]));
 }
 
 #[tokio::test]

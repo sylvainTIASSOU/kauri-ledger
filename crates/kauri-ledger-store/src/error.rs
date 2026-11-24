@@ -33,6 +33,9 @@ pub enum StoreError {
     #[error("INVALID_ROUTE_SCOPE: invalid tenant posting route")]
     InvalidRouteScope,
 
+    #[error("UNSAFE_RUNTIME_ROLE: privileged database credentials cannot serve HTTP traffic")]
+    UnsafeRuntimeRole,
+
     #[error("INVALID_REQUEST_JSON: {0}")]
     InvalidRequestJson(#[from] RequestHashError),
 }

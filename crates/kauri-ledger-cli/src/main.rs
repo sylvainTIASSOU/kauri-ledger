@@ -1,4 +1,5 @@
 mod audit;
+mod keys;
 
 use clap::{Parser, Subcommand};
 use kauri_ledger_core::AccountCode;
@@ -38,6 +39,15 @@ enum Commands {
         /// Output format for the audit report.
         #[arg(long, value_enum, default_value = "text")]
         format: audit::AuditFormat,
+    },
+    /// Manage API keys through the private control plane.
+    Keys {
+        /// Privileged administrative database connection.
+        #[arg(long, env = "LEDGER_ADMIN_DATABASE_URL")]
+        database_url: String,
+
+        #[command(subcommand)]
+        command: keys::KeysCommand,
     },
 }
 
@@ -110,6 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             Ok(())
+        }
+        Commands::Keys {
+            database_url,
+            command,
+        } => {
+            let pool = create_pool(&database_url).await?;
+            keys::execute(&pool, command).await
         }
     }
 }

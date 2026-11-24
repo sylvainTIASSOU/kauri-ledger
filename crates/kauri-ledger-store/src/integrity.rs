@@ -55,6 +55,13 @@ pub enum LedgerStructuralIssue {
         entry_id: i64,
         transaction_id: Uuid,
     },
+    MissingTransactionSeal {
+        transaction_id: Uuid,
+    },
+
+    SealWithoutTransaction {
+        transaction_id: Uuid,
+    },
     InvalidTransaction {
         transaction_id: Uuid,
         entry_count: i64,
@@ -204,6 +211,40 @@ pub async fn verify_ledger_integrity(
             GROUP BY t.id
             ORDER BY t.id
             "#,
+    )
+    .bind(ledger_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+
+    // Every committed transaction must have a validation seal.
+    let missing_seals: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT t.id
+        FROM ledger.transactions AS t
+        LEFT JOIN ledger.transaction_seals AS s
+          ON s.ledger_id = t.ledger_id
+         AND s.transaction_id = t.id
+        WHERE t.ledger_id = $1
+          AND s.transaction_id IS NULL
+        ORDER BY t.id
+        "#,
+    )
+    .bind(ledger_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+
+    // Detect seals whose parent transaction no longer exists.
+    let orphan_seals: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT s.transaction_id
+        FROM ledger.transaction_seals AS s
+        LEFT JOIN ledger.transactions AS t
+          ON t.ledger_id = s.ledger_id
+         AND t.id = s.transaction_id
+        WHERE s.ledger_id = $1
+          AND t.id IS NULL
+        ORDER BY s.transaction_id
+        "#,
     )
     .bind(ledger_id)
     .fetch_all(&mut *transaction)
@@ -372,6 +413,14 @@ pub async fn verify_ledger_integrity(
                 journal_credit_total,
             });
         }
+    }
+
+    for transaction_id in missing_seals {
+        structural_issues.push(LedgerStructuralIssue::MissingTransactionSeal { transaction_id });
+    }
+
+    for transaction_id in orphan_seals {
+        structural_issues.push(LedgerStructuralIssue::SealWithoutTransaction { transaction_id });
     }
 
     Ok(Some(LedgerIntegrityReport {

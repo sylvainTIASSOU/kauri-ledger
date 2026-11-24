@@ -71,6 +71,15 @@ impl AppError {
             message: "An unexpected error occurred".to_owned(),
         }
     }
+
+    /// Construct an explicitly approved public error.
+    pub fn public(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -83,6 +92,11 @@ impl IntoResponse for AppError {
         );
 
         let mut response = (self.status, Json(body)).into_response();
+        if self.code == "CONCURRENT_REQUEST" {
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+        }
         // the middleware get these metadata without having to decode the response body.
         response.extensions_mut().insert(self);
 

@@ -414,3 +414,58 @@ async fn detects_orphan_balances_and_orphan_entries() {
         )
     }));
 }
+
+#[tokio::test]
+async fn detects_missing_and_orphan_transaction_seals() {
+    let db = common::TestDb::new().await;
+
+    let ledger_id = create_ledger(&db.pool).await;
+
+    let (funding_id, wallet_id) = create_accounts(&db.pool, ledger_id).await;
+
+    let transaction_id = post_funding(&db.pool, ledger_id, funding_id, wallet_id).await;
+
+    // Simulate deletion of a legitimate transaction seal.
+    simulate_corruption(
+        &db.pool,
+        "DELETE FROM ledger.transaction_seals \
+         WHERE ledger_id = $1 AND transaction_id = $2",
+        ledger_id,
+        transaction_id,
+    )
+    .await;
+
+    let unknown_transaction_id = Uuid::now_v7();
+
+    // Simulate a seal without a parent transaction.
+    simulate_corruption(
+        &db.pool,
+        "INSERT INTO ledger.transaction_seals \
+         (ledger_id, transaction_id) \
+         VALUES ($1, $2)",
+        ledger_id,
+        unknown_transaction_id,
+    )
+    .await;
+
+    let report = verify_ledger_integrity(&db.pool, ledger_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!report.is_healthy());
+
+    assert!(report.structural_issues.iter().any(|issue| matches!(
+        issue,
+        LedgerStructuralIssue::MissingTransactionSeal {
+            transaction_id: id,
+        } if *id == transaction_id
+    )));
+
+    assert!(report.structural_issues.iter().any(|issue| matches!(
+        issue,
+        LedgerStructuralIssue::SealWithoutTransaction {
+            transaction_id: id,
+        } if *id == unknown_transaction_id
+    )));
+}

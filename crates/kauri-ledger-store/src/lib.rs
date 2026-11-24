@@ -1,5 +1,7 @@
 //! PostgreSQL persistence layer for Kauri Ledger.
 
+pub mod api_auth;
+pub mod authorized_repository;
 pub mod db;
 pub mod error;
 pub mod idempotency;
