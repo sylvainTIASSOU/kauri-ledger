@@ -62,6 +62,10 @@ pub enum LedgerStructuralIssue {
     SealWithoutTransaction {
         transaction_id: Uuid,
     },
+    InvalidReversal {
+        transaction_id: Uuid,
+        original_transaction_id: Uuid,
+    },
     InvalidTransaction {
         transaction_id: Uuid,
         entry_count: i64,
@@ -250,6 +254,28 @@ pub async fn verify_ledger_integrity(
     .fetch_all(&mut *transaction)
     .await?;
 
+    // Verify every reversal against its immutable source journal.
+    // This also detects missing or unsealed source transactions.
+    let invalid_reversals: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        r#"
+        SELECT
+            t.id,
+            t.reverses_transaction
+        FROM ledger.transactions AS t
+        WHERE t.ledger_id = $1
+          AND t.reverses_transaction IS NOT NULL
+          AND ledger.reversal_matches_original(
+              t.ledger_id,
+              t.reverses_transaction,
+              t.id
+          ) IS DISTINCT FROM TRUE
+        ORDER BY t.id
+        "#,
+    )
+    .bind(ledger_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+
     // Include orphan data when calculating global conservation.
     let stored_totals: (String, String) = sqlx::query_as(
         r#"
@@ -421,6 +447,13 @@ pub async fn verify_ledger_integrity(
 
     for transaction_id in orphan_seals {
         structural_issues.push(LedgerStructuralIssue::SealWithoutTransaction { transaction_id });
+    }
+
+    for (transaction_id, original_transaction_id) in invalid_reversals {
+        structural_issues.push(LedgerStructuralIssue::InvalidReversal {
+            transaction_id,
+            original_transaction_id,
+        });
     }
 
     Ok(Some(LedgerIntegrityReport {

@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Fetch all accounts
                 let accounts: Vec<(String,)> =
-                    sqlx::query_as::<_, (String,)>("SELECT code FROM accounts")
+                    sqlx::query_as::<_, (String,)>("SELECT code FROM public.accounts")
                         .fetch_all(&pool)
                         .await?;
 

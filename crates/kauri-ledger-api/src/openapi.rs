@@ -27,6 +27,7 @@ impl Modify for BearerSecurity {
         crate::controllers::hello::hello_handler,
         crate::controllers::health::health_handler,
         crate::controllers::ledger::post_transaction,
+        crate::controllers::ledger::reverse_transaction,
         crate::controllers::ledger::account_balance,
         crate::controllers::ledger::transaction_by_id,
     ),

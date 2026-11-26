@@ -146,6 +146,68 @@ async fn http_post_replays_bytes_and_enforces_tenant_scopes() {
     assert_restricted_runtime_pool(&runtime_pool).await.unwrap();
     assert!(assert_restricted_runtime_pool(&admin_pool).await.is_err());
 
+    // Simulate unsafe database permission changes.
+    // Each case must be rejected by the runtime startup guard.
+    let unsafe_grants = [
+        (
+            "GRANT SELECT ON public.accounts TO ledger_http_test",
+            "REVOKE SELECT ON public.accounts FROM ledger_http_test",
+        ),
+        (
+            "GRANT SELECT (label) ON ledger.api_keys TO ledger_http_test",
+            "REVOKE SELECT (label) ON ledger.api_keys FROM ledger_http_test",
+        ),
+        (
+            "GRANT UPDATE ON ledger.account_balances TO ledger_http_test",
+            "REVOKE UPDATE ON ledger.account_balances FROM ledger_http_test",
+        ),
+        (
+            "GRANT ledger_readonly TO ledger_http_test",
+            "REVOKE ledger_readonly FROM ledger_http_test",
+        ),
+        (
+            "GRANT ledger_migrator TO ledger_http_test",
+            "REVOKE ledger_migrator FROM ledger_http_test",
+        ),
+        (
+            "GRANT CREATE ON SCHEMA public TO ledger_http_test",
+            "REVOKE CREATE ON SCHEMA public FROM ledger_http_test",
+        ),
+        (
+            "GRANT EXECUTE ON FUNCTION \
+             ledger.post_transaction( \
+                 UUID, UUID, TEXT, TEXT, BYTEA, BYTEA, \
+                 TIMESTAMPTZ, JSONB \
+             ) TO ledger_http_test",
+            "REVOKE EXECUTE ON FUNCTION \
+             ledger.post_transaction( \
+                 UUID, UUID, TEXT, TEXT, BYTEA, BYTEA, \
+                 TIMESTAMPTZ, JSONB \
+             ) FROM ledger_http_test",
+        ),
+    ];
+
+    for (grant, revoke) in unsafe_grants {
+        sqlx::query(grant).execute(&admin_pool).await.unwrap();
+
+        let result = assert_restricted_runtime_pool(&runtime_pool).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(kauri_ledger_store::StoreError::UnsafeRuntimeRole)
+            ),
+            "Unsafe permission was not rejected: {grant}"
+        );
+
+        // Restore the correct least-privilege configuration.
+        sqlx::query(revoke).execute(&admin_pool).await.unwrap();
+
+        assert_restricted_runtime_pool(&runtime_pool)
+            .await
+            .expect("Runtime must be accepted after removing the unsafe grant");
+    }
+
     let app = build_router_with_ledger(LedgerApiState { pool: runtime_pool });
     let path = format!("/v1/ledgers/{ledger_id}/transactions");
     let body = format!(
@@ -166,6 +228,24 @@ async fn http_post_replays_bytes_and_enforces_tenant_scopes() {
     assert_eq!(posted["status"], "posted");
     assert!(posted["balances_after"].is_array());
     assert_eq!(posted["balances_after"].as_array().unwrap().len(), 2);
+    // The response snapshot must match the actual committed balances.
+    let balances = posted["balances_after"].as_array().unwrap();
+
+    for (account_id, expected_total) in [(wallet_id, "100"), (funding_id, "-100")] {
+        let account = serde_json::json!(account_id);
+
+        let balance = balances
+            .iter()
+            .find(|item| item["account_id"] == account)
+            .expect("Missing account in the posting snapshot");
+
+        assert_eq!(balance["posted_total"], expected_total,);
+
+        assert_eq!(balance["available_total"], expected_total,);
+
+        assert_eq!(balance["reserved_total"], "0");
+        assert_eq!(balance["version"], 1);
+    }
 
     let equivalent = format!(
         r#"{{"entries":[{{"amount":100,"side":"D","account_id":"{wallet_id}"}},{{"amount":100,"side":"C","account_id":"{funding_id}"}}]}}"#
@@ -262,6 +342,233 @@ async fn http_post_replays_bytes_and_enforces_tenant_scopes() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // C3: Reverse the committed transaction through HTTP.
+    let reverse_uri = format!("{transaction_uri}/reverse");
+
+    let (status, reversed_body) = send(
+        &app,
+        Method::POST,
+        &reverse_uri,
+        Some(&key),
+        Some("http-reversal-0001"),
+        "{}",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&reversed_body),
+    );
+
+    let reversed: Value = serde_json::from_slice(&reversed_body).unwrap();
+
+    assert_eq!(reversed["status"], "posted");
+    assert_eq!(reversed["reverses_transaction"], transaction_id,);
+
+    let reversal_id = reversed["transaction_id"].as_str().unwrap();
+
+    assert_ne!(reversal_id, transaction_id);
+
+    assert_eq!(reversed["balances_after"].as_array().unwrap().len(), 2,);
+
+    // The exact same idempotent request returns stored bytes.
+    let (status, replayed_reversal) = send(
+        &app,
+        Method::POST,
+        &reverse_uri,
+        Some(&key),
+        Some("http-reversal-0001"),
+        "{ }",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(replayed_reversal, reversed_body);
+
+    // A second reversal with a different key is forbidden.
+    let (status, duplicate_reversal) = send(
+        &app,
+        Method::POST,
+        &reverse_uri,
+        Some(&key),
+        Some("http-reversal-0002"),
+        "{}",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let duplicate: Value = serde_json::from_slice(&duplicate_reversal).unwrap();
+
+    assert_eq!(duplicate["error"]["code"], "ALREADY_REVERSED");
+
+    // Only an empty JSON object is accepted for reversals.
+    for invalid_body in [
+        "[]",
+        "null",
+        "100",
+        r#""reverse""#,
+        r#"{"amount":100}"#,
+        r#"{"effective_at":null}"#,
+        r#"{"amount":100,"amount":200}"#,
+    ] {
+        let (status, error_body) = send(
+            &app,
+            Method::POST,
+            &reverse_uri,
+            Some(&key),
+            Some("http-reversal-0003"),
+            invalid_body,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "Invalid body was not rejected: {invalid_body}",
+        );
+
+        let error: Value = serde_json::from_slice(&error_body).unwrap();
+
+        assert_eq!(error["error"]["code"], "VALIDATION_ERROR",);
+    }
+
+    // A read-only API key cannot reverse transactions.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &reverse_uri,
+        Some(&read_key),
+        Some("http-reversal-0004"),
+        "{}",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A missing API key cannot reverse transactions.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &reverse_uri,
+        None,
+        Some("http-reversal-0005"),
+        "{}",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A key for ledger A cannot reverse an operation in ledger B.
+    let foreign_reverse_uri =
+        format!("/v1/ledgers/{foreign_id}/transactions/{transaction_id}/reverse");
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &foreign_reverse_uri,
+        Some(&key),
+        Some("http-reversal-0006"),
+        "{}",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The original transaction remains readable and unchanged.
+    let (status, original_after_reversal) =
+        send(&app, Method::GET, &transaction_uri, Some(&key), None, "").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(original_after_reversal, initial);
+
+    // The reversal itself can be read as a committed transaction.
+    let reversal_transaction_uri = format!("/v1/ledgers/{ledger_id}/transactions/{reversal_id}");
+
+    let (status, stored_reversal) = send(
+        &app,
+        Method::GET,
+        &reversal_transaction_uri,
+        Some(&key),
+        None,
+        "",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored_reversal, reversed_body);
+
+    // The wallet must return to its initial balance.
+    let (status, restored_balance) =
+        send(&app, Method::GET, &balance_uri, Some(&key), None, "").await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let restored: Value = serde_json::from_slice(&restored_balance).unwrap();
+
+    assert_eq!(restored["posted_total"], "0");
+    assert_eq!(restored["available_total"], "0");
+
+    // Replaying the original posting must return its historical
+    // response, even though the current wallet balance has changed.
+    let (status, historical_replay) = send(
+        &app,
+        Method::POST,
+        &path,
+        Some(&key),
+        Some("http-post-0001"),
+        &body,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(historical_replay, initial);
+
+    let (status, current_balance) =
+        send(&app, Method::GET, &balance_uri, Some(&key), None, "").await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let current: Value = serde_json::from_slice(&current_balance).unwrap();
+
+    assert_eq!(current["posted_total"], "0");
+
+    // A reversal is also a transaction and may itself be reversed.
+    let reverse_reversal_uri = format!("{reversal_transaction_uri}/reverse");
+
+    let (status, second_reversal_body) = send(
+        &app,
+        Method::POST,
+        &reverse_reversal_uri,
+        Some(&key),
+        Some("http-reversal-0007"),
+        "{}",
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&second_reversal_body),
+    );
+
+    let second_reversal: Value = serde_json::from_slice(&second_reversal_body).unwrap();
+
+    assert_eq!(second_reversal["reverses_transaction"], reversal_id,);
+
+    // After two compensating reversals, the original
+    // transaction's effect must be restored.
+    let (status, final_balance) = send(&app, Method::GET, &balance_uri, Some(&key), None, "").await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let final_balance: Value = serde_json::from_slice(&final_balance).unwrap();
+
+    assert_eq!(final_balance["posted_total"], "100");
 
     // Authorization must observe revocation immediately.
     sqlx::query("UPDATE ledger.api_keys SET revoked_at = NOW() WHERE key_hash = $1")

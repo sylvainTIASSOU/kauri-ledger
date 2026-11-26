@@ -1,3 +1,9 @@
+//! Legacy single-tenant accounting repository.
+//!
+//! Retained for compatibility and trusted maintenance workflows.
+//! Never use this repository from tenant-facing HTTP handlers.
+//! New accounting operations must use the tenant-authorized engine.
+
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -44,7 +50,7 @@ pub async fn create_account(
     let db_type = to_db_account_type(account_type);
     sqlx::query(
         r#"
-        INSERT INTO accounts (code, account_type)
+        INSERT INTO public.accounts (code, account_type)
         VALUES ($1, $2)
         "#,
     )
@@ -74,7 +80,7 @@ pub async fn record_transaction(
     let existing: Option<DbTransaction> = sqlx::query_as(
         r#"
         SELECT id, idempotency_key, payload_hash, created_at
-        FROM transactions
+        FROM public.transactions
         WHERE idempotency_key = $1
         "#,
     )
@@ -140,7 +146,7 @@ async fn try_record_transaction(
     // Insert the transaction record
     let tx_id: Uuid = sqlx::query_scalar(
         r#"
-        INSERT INTO transactions (idempotency_key, payload_hash)
+        INSERT INTO public.transactions (idempotency_key, payload_hash)
         VALUES ($1, $2)
         RETURNING id
         "#,
@@ -165,7 +171,7 @@ async fn try_record_transaction(
     for code in &account_codes {
         sqlx::query(
             r#"
-            INSERT INTO balances (account_code, balance, version)
+            INSERT INTO public.balances (account_code, balance, version)
             VALUES ($1, 0, 0)
             ON CONFLICT (account_code) DO NOTHING
             "#,
@@ -198,7 +204,7 @@ async fn try_record_transaction(
 
         sqlx::query(
             r#"
-            INSERT INTO entries (transaction_id, account_code, direction, amount)
+            INSERT INTO public.entries (transaction_id, account_code, direction, amount)
             VALUES ($1, $2, $3, $4)
             "#,
         )
@@ -214,7 +220,7 @@ async fn try_record_transaction(
 
         sqlx::query(
             r#"
-            UPDATE balances
+            UPDATE public.balances
             SET balance = balance + $1,
                 version = version + 1,
                 updated_at = NOW()
@@ -239,7 +245,7 @@ pub async fn get_balance(
     let balance: Option<DbBalance> = sqlx::query_as(
         r#"
         SELECT account_code, balance, version, updated_at
-        FROM balances
+        FROM public.balances
         WHERE account_code = $1
         "#,
     )
@@ -257,7 +263,7 @@ pub async fn get_account_history(
     let entries: Vec<DbEntry> = sqlx::query_as(
         r#"
         SELECT id, transaction_id, account_code, direction, amount, created_at
-        FROM entries
+        FROM public.entries
         WHERE account_code = $1
         ORDER BY created_at ASC, id ASC
         "#,

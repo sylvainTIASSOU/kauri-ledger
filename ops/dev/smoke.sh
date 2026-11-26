@@ -51,6 +51,28 @@ curl --fail --silent --show-error \
 
 echo "PASS: API health"
 
+echo "Checking read API key before posting..."
+
+status="$(curl -sS \
+    -o "$TMP_DIR/read-preflight.json" \
+    -w '%{http_code}' \
+    "$BALANCE_URL" \
+    -H "Authorization: Bearer $READ_KEY")"
+
+assert_status "$status" "200" "Read key preflight"
+
+FUNDING_URL="$BASE_URL/v1/ledgers/$LEDGER_A/accounts/asset:funding/balance"
+
+status="$(curl -sS \
+    -o "$TMP_DIR/funding-before.json" \
+    -w '%{http_code}' \
+    "$FUNDING_URL" \
+    -H "Authorization: Bearer $READ_KEY")"
+
+assert_status "$status" "200" "Funding balance preflight"
+
+echo "Initial accounting state captured"
+
 echo "Posting a balanced transaction..."
 
 status="$(curl -sS \
@@ -66,6 +88,12 @@ assert_status "$status" "201" "Transaction creation"
 
 jq -e '.status == "posted"' \
     "$TMP_DIR/posted.json" >/dev/null
+
+ORIGINAL_ID="$(jq -er '.transaction_id' "$TMP_DIR/posted.json")"
+
+echo "Posted transaction: $ORIGINAL_ID"
+echo "Posting idempotency key: $IDEMPOTENCY_KEY"
+
 
 echo "Replaying the same transaction..."
 
@@ -148,5 +176,193 @@ status="$(curl -sS \
     --data-binary @"$TMP_DIR/changed.json")"
 
 assert_status "$status" "422" "Idempotency conflict"
+
+
+REVERSE_URL="$POST_URL/$ORIGINAL_ID/reverse"
+REVERSAL_KEY="$IDEMPOTENCY_KEY-reverse"
+
+reverse_request() {
+    local token="$1"
+    local key="$2"
+    local output="$3"
+
+    curl -sS \
+        -o "$output" \
+        -w '%{http_code}' \
+        -X POST "$REVERSE_URL" \
+        -H "Authorization: Bearer $token" \
+        -H "Idempotency-Key: $key" \
+        -H "Content-Type: application/json" \
+        --data-binary '{}'
+}
+
+echo "Checking reversal authorization..."
+
+status="$(reverse_request \
+    "$READ_KEY" \
+    "$REVERSAL_KEY-forbidden" \
+    "$TMP_DIR/reverse-forbidden.json")"
+
+assert_status "$status" "403" \
+    "Read-only key cannot reverse"
+
+echo "Reversing the smoke test transaction..."
+echo "Reversal idempotency key: $REVERSAL_KEY"
+
+status="$(reverse_request \
+    "$WRITE_KEY" \
+    "$REVERSAL_KEY" \
+    "$TMP_DIR/reversed.json")"
+
+assert_status "$status" "201" "Transaction reversal"
+
+jq -e \
+    --arg original "$ORIGINAL_ID" \
+    '.status == "posted"
+     and .reverses_transaction == $original
+     and .transaction_id != $original' \
+    "$TMP_DIR/reversed.json" >/dev/null
+
+REVERSAL_ID="$(jq -er \
+    '.transaction_id' \
+    "$TMP_DIR/reversed.json")"
+
+echo "Reversal transaction: $REVERSAL_ID"
+
+echo "Replaying the reversal..."
+
+status="$(reverse_request \
+    "$WRITE_KEY" \
+    "$REVERSAL_KEY" \
+    "$TMP_DIR/reversed-replay.json")"
+
+assert_status "$status" "201" "Idempotent reversal replay"
+
+cmp -s \
+    "$TMP_DIR/reversed.json" \
+    "$TMP_DIR/reversed-replay.json"
+
+echo "PASS: Identical reversal replay bytes"
+
+echo "Checking duplicate reversal protection..."
+
+status="$(reverse_request \
+    "$WRITE_KEY" \
+    "$REVERSAL_KEY-duplicate" \
+    "$TMP_DIR/reverse-duplicate.json")"
+
+assert_status "$status" "409" "Duplicate reversal"
+
+jq -e '.error.code == "ALREADY_REVERSED"' \
+    "$TMP_DIR/reverse-duplicate.json" >/dev/null
+
+echo "Checking immutable transaction responses..."
+
+for transaction_id in "$ORIGINAL_ID" "$REVERSAL_ID"; do
+    status="$(curl -sS \
+        -o "$TMP_DIR/transaction-$transaction_id.json" \
+        -w '%{http_code}' \
+        "$POST_URL/$transaction_id" \
+        -H "Authorization: Bearer $READ_KEY")"
+
+    assert_status "$status" "200" \
+        "Read committed transaction $transaction_id"
+done
+
+cmp -s \
+    "$TMP_DIR/posted.json" \
+    "$TMP_DIR/transaction-$ORIGINAL_ID.json"
+
+cmp -s \
+    "$TMP_DIR/reversed.json" \
+    "$TMP_DIR/transaction-$REVERSAL_ID.json"
+
+echo "PASS: Immutable historical responses"
+
+echo "Reading final account balances..."
+
+status="$(curl -sS \
+    -o "$TMP_DIR/wallet-after.json" \
+    -w '%{http_code}' \
+    "$BALANCE_URL" \
+    -H "Authorization: Bearer $READ_KEY")"
+
+assert_status "$status" "200" "Final wallet balance"
+
+status="$(curl -sS \
+    -o "$TMP_DIR/funding-after.json" \
+    -w '%{http_code}' \
+    "$FUNDING_URL" \
+    -H "Authorization: Bearer $READ_KEY")"
+
+assert_status "$status" "200" "Final funding balance"
+
+python3 - "$TMP_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+
+
+def load(filename):
+    return json.loads((directory / filename).read_text())
+
+
+posted = load("posted.json")
+reversed_tx = load("reversed.json")
+
+posted_balances = {
+    item["account_code"]: item
+    for item in posted["balances_after"]
+}
+
+reversed_balances = {
+    item["account_code"]: item
+    for item in reversed_tx["balances_after"]
+}
+
+for code, before_file, after_file, delta in [
+    ("asset:wallet", "read-preflight.json", "wallet-after.json", 1000),
+    ("asset:funding", "funding-before.json", "funding-after.json", -1000),
+]:
+    before = load(before_file)
+    after = load(after_file)
+
+    posting = posted_balances[code]
+    reversal = reversed_balances[code]
+
+    assert before["account_code"] == code
+    assert after["account_code"] == code
+
+    assert (
+        int(posting["posted_total"])
+        == int(before["posted_total"]) + delta
+    ), f"{code}: unexpected posting delta"
+
+    for field in (
+        "posted_total",
+        "reserved_total",
+        "available_total",
+    ):
+        assert int(after[field]) == int(before[field]), (
+            f"{code}: {field} was not restored"
+        )
+
+        assert int(reversal[field]) == int(after[field]), (
+            f"{code}: reversal snapshot mismatch for {field}"
+        )
+
+    initial_version = int(before["balance_version"])
+
+    assert int(posting["version"]) == initial_version + 1
+    assert int(reversal["version"]) == initial_version + 2
+    assert int(after["balance_version"]) == initial_version + 2
+
+    print(f"PASS: {code} restored with exactly two balance updates")
+
+print("PASS: Accounting conservation after posting and reversal")
+PY
+
 
 echo "PASS: All Kauri Ledger smoke tests completed"

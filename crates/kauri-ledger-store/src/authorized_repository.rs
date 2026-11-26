@@ -208,42 +208,201 @@ async fn post_once(
     })
 }
 
-/// Reject accidental use of privileged migration credentials by the HTTP API.
-/// The runtime login must inherit only ledger_app's required privileges.
+/// Validate the PostgreSQL identity used by the HTTP runtime.
+///
+/// Reject unexpected role memberships, direct accounting privileges,
+/// administrative function access and object creation privileges.
+///
+/// This is a startup configuration check, not a replacement
+/// for PostgreSQL authorization during individual requests.
 pub async fn assert_restricted_runtime_pool(pool: &PgPool) -> Result<(), StoreError> {
-    let (is_superuser, can_create_role, bypasses_rls, can_create_db): (bool, bool, bool, bool) =
-        sqlx::query_as(
-            "SELECT rolsuper, rolcreaterole, rolbypassrls, rolcreatedb \
-         FROM pg_catalog.pg_roles WHERE rolname = current_user",
-        )
-        .fetch_one(pool)
-        .await?;
-
-    let (can_read_keys, can_write_transactions, can_execute_wrapper):
-        (bool, bool, bool) = sqlx::query_as(
+    let safe: bool = sqlx::query_scalar(
         r#"
-        SELECT
-            has_table_privilege(current_user, 'ledger.api_keys', 'SELECT'),
-            has_table_privilege(current_user, 'ledger.transactions', 'INSERT'),
-            has_function_privilege(
+        WITH runtime_roles AS (
+            SELECT
+                r.oid,
+                r.rolname,
+                r.rolsuper,
+                r.rolcreaterole,
+                r.rolcreatedb,
+                r.rolreplication,
+                r.rolbypassrls
+            FROM pg_catalog.pg_roles AS r
+            WHERE r.rolname IN (
                 current_user,
-                'ledger.authorized_post_transaction(text,bytea,uuid,uuid,text,text,bytea,bytea,timestamptz,jsonb)',
-                'EXECUTE'
+                'ledger_app'
+            )
+        ),
+        allowed_functions AS (
+            SELECT function_id
+            FROM (
+                VALUES
+                (
+                    'ledger.api_key_access(text,bytea,uuid,text)'
+                        ::regprocedure
+                ),
+                (
+                    'ledger.authorized_post_transaction(text,bytea,uuid,uuid,text,text,bytea,bytea,timestamptz,jsonb)'
+                        ::regprocedure
+                ),
+                (
+                    'ledger.authorized_get_balance(text,bytea,uuid,text)'
+                        ::regprocedure
+                ),
+                (
+                    'ledger.authorized_get_transaction(text,bytea,uuid,uuid)'
+                        ::regprocedure
+                ),
+                (
+                    'ledger.authorized_reverse_transaction(text,bytea,uuid,uuid,uuid,text,bytea,timestamptz)'
+                        ::regprocedure
+                )
+            ) AS permitted(function_id)
+        )
+        SELECT
+            current_user = session_user
+
+            AND current_user <> 'ledger_app'
+
+            AND pg_has_role(
+                current_user,
+                'ledger_app',
+                'USAGE'
+            )
+
+            -- Neither runtime identity may have privileged attributes.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_roles AS r
+                WHERE r.rolsuper
+                   OR r.rolcreaterole
+                   OR r.rolcreatedb
+                   OR r.rolreplication
+                   OR r.rolbypassrls
+            )
+
+            -- Reject unexpected direct or indirect role memberships.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_roles AS r
+                CROSS JOIN pg_catalog.pg_roles AS member_role
+                WHERE member_role.oid <> r.oid
+                  AND member_role.rolname <> 'ledger_app'
+                  AND pg_has_role(
+                      r.oid,
+                      member_role.oid,
+                      'MEMBER'
+                  )
+            )
+
+            -- Runtime identities must not create persistent objects.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_roles AS r
+                WHERE has_database_privilege(
+                    r.oid,
+                    current_database(),
+                    'CREATE'
+                )
+                OR has_schema_privilege(
+                    r.oid,
+                    'public',
+                    'CREATE'
+                )
+                OR has_schema_privilege(
+                    r.oid,
+                    'ledger',
+                    'CREATE'
+                )
+            )
+
+            -- Reject direct table and column access.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_roles AS r
+                CROSS JOIN pg_catalog.pg_class AS c
+                JOIN pg_catalog.pg_namespace AS n
+                  ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                  AND (
+                      n.nspname = 'ledger'
+                      OR (
+                          n.nspname = 'public'
+                          AND c.relname IN (
+                              'accounts',
+                              'transactions',
+                              'entries',
+                              'balances'
+                          )
+                      )
+                  )
+                  AND (
+                      has_table_privilege(
+                          r.oid,
+                          c.oid,
+                          'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+                      )
+                      OR has_any_column_privilege(
+                          r.oid,
+                          c.oid,
+                          'SELECT,INSERT,UPDATE,REFERENCES'
+                      )
+                  )
+            )
+
+            -- Reject direct access to accounting sequences.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_roles AS r
+                CROSS JOIN pg_catalog.pg_class AS c
+                JOIN pg_catalog.pg_namespace AS n
+                  ON n.oid = c.relnamespace
+                WHERE n.nspname = 'ledger'
+                  AND c.relkind = 'S'
+                  AND has_sequence_privilege(
+                      r.oid,
+                      c.oid,
+                      'USAGE,SELECT,UPDATE'
+                  )
+            )
+
+            -- All required tenant-facing functions must be executable.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM allowed_functions AS f
+                WHERE NOT has_function_privilege(
+                    current_user,
+                    f.function_id::oid,
+                    'EXECUTE'
+                )
+            )
+
+            -- Reject execution of any other ledger function.
+            AND NOT EXISTS (
+                SELECT 1
+                FROM runtime_roles AS r
+                CROSS JOIN pg_catalog.pg_proc AS p
+                JOIN pg_catalog.pg_namespace AS n
+                  ON n.oid = p.pronamespace
+                WHERE n.nspname = 'ledger'
+                  AND p.oid NOT IN (
+                      SELECT function_id::oid
+                      FROM allowed_functions
+                  )
+                  AND has_function_privilege(
+                      r.oid,
+                      p.oid,
+                      'EXECUTE'
+                  )
             )
         "#,
     )
     .fetch_one(pool)
     .await?;
 
-    if is_superuser
-        || can_create_role
-        || bypasses_rls
-        || can_create_db
-        || can_read_keys
-        || can_write_transactions
-        || !can_execute_wrapper
-    {
+    if !safe {
         return Err(StoreError::UnsafeRuntimeRole);
     }
+
     Ok(())
 }

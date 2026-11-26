@@ -17,6 +17,7 @@ use kauri_ledger_store::{
         get_authorized_balance, get_authorized_transaction, post_authorized_transaction,
     },
     idempotency::compute_request_hash,
+    reversal_repository::{AuthorizedReversal, reverse_authorized_transaction},
     tenant_repository::{TenantLedgerEntry, TenantPosting},
 };
 use serde::Deserialize;
@@ -46,6 +47,13 @@ struct PostingBody {
     entries: Vec<PostingEntry>,
     effective_at: Option<DateTime<Utc>>,
 }
+
+/// Reversals accept no client-defined accounting entries.
+///
+/// In v1, the request body must be an empty JSON object.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ReversalBody {}
 
 fn public_error(status: StatusCode, code: &'static str, message: &'static str) -> AppError {
     AppError::public(status, code, message)
@@ -135,6 +143,21 @@ fn store_error(error: StoreError) -> AppError {
                 "ACCOUNT_NOT_FOUND",
                 "One of the requested accounts does not exist",
             ),
+            Some("23514") if message.starts_with("ALREADY_REVERSED") => public_error(
+                StatusCode::CONFLICT,
+                "ALREADY_REVERSED",
+                "This transaction has already been reversed",
+            ),
+            Some("23514")
+                if message.starts_with("TRANSACTION_NOT_SEALED")
+                    || message.starts_with("INVALID_ORIGINAL_TRANSACTION") =>
+            {
+                public_error(
+                    StatusCode::CONFLICT,
+                    "REVERSAL_SOURCE_INVALID",
+                    "The original transaction cannot be reversed",
+                )
+            }
             Some("23514") if message.starts_with("IDEMPOTENCY_KEY_REUSED") => public_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "IDEMPOTENCY_KEY_REUSED",
@@ -182,6 +205,13 @@ fn store_error(error: StoreError) -> AppError {
                 "DATABASE_BUSY",
                 "The ledger is temporarily busy",
             ),
+            Some("23505") if db_error.constraint() == Some("transactions_reverses_once") => {
+                public_error(
+                    StatusCode::CONFLICT,
+                    "ALREADY_REVERSED",
+                    "This transaction has already been reversed",
+                )
+            }
             _ => AppError::internal(),
         };
     }
@@ -354,6 +384,136 @@ pub async fn post_transaction(
 
     // Both the original posting and its replay return the stored bytes.
     Ok(json_response(posted.response_body, StatusCode::CREATED))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/ledgers/{ledger_id}/transactions/{transaction_id}/reverse",
+    tag = "ledger",
+    params(
+        (
+            "ledger_id" = Uuid,
+            Path,
+            description = "Ledger identifier"
+        ),
+        (
+            "transaction_id" = Uuid,
+            Path,
+            description = "Original transaction identifier"
+        ),
+        (
+            "Idempotency-Key" = String,
+            Header,
+            description = "Unique request key, 8 to 200 characters"
+        )
+    ),
+    request_body(
+        content = ReversalBody,
+        content_type = "application/json",
+        description = "An empty JSON object. Reversal entries are derived from the stored transaction."
+    ),
+    responses(
+        (
+            status = 201,
+            description = "Reversal created or idempotently replayed"
+        ),
+        (
+            status = 400,
+            description = "Invalid reversal request"
+        ),
+        (
+            status = 401,
+            description = "Invalid or missing API key"
+        ),
+        (
+            status = 403,
+            description = "Insufficient API key scope"
+        ),
+        (
+            status = 404,
+            description = "Ledger or original transaction not found"
+        ),
+        (
+            status = 409,
+            description = "Already reversed, frozen ledger, or closed period"
+        ),
+        (
+            status = 422,
+            description = "Insufficient funds"
+        ),
+        (
+            status = 503,
+            description = "Temporary database contention"
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reverse_transaction(
+    State(state): State<LedgerApiState>,
+    Path((ledger_id, original_transaction_id)): Path<(Uuid, Uuid)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    // Fail early when the API key is missing or lacks write access.
+    // PostgreSQL will authorize again inside the reversal function.
+    let proof = authorize(&state.pool, &headers, ledger_id, ApiScope::Write).await?;
+
+    let expected_path =
+        format!("/v1/ledgers/{ledger_id}/transactions/{original_transaction_id}/reverse");
+
+    if original_uri.path() != expected_path
+        || original_uri.query().is_some()
+        || body.len() > 256 * 1024
+        || headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            != Some("application/json")
+    {
+        return Err(invalid_request());
+    }
+
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| (8..=200).contains(&value.chars().count()))
+        .ok_or_else(invalid_request)?;
+
+    // Validate I-JSON first: this rejects duplicate keys and
+    // unsafe JSON integers before Serde's typed decoding.
+    compute_request_hash("POST", &expected_path, &body).map_err(|_| invalid_request())?;
+
+    // No custom amounts, accounts, timestamps or unknown fields
+    // are accepted for a reversal in this API version.
+    // Require an actual empty JSON object.
+    // Other JSON types are not valid reversal requests.
+    let document: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
+
+    if !matches!(
+        &document,
+        Value::Object(object) if object.is_empty()
+    ) {
+        return Err(invalid_request());
+    }
+
+    let _: ReversalBody = serde_json::from_value(document).map_err(|_| invalid_request())?;
+
+    let request = AuthorizedReversal {
+        ledger_id,
+        original_transaction_id,
+        reversal_transaction_id: Uuid::now_v7(),
+        idempotency_key,
+        raw_request_body: &body,
+        effective_at: Utc::now(),
+    };
+
+    let reversed = reverse_authorized_transaction(&state.pool, &proof, &request)
+        .await
+        .map_err(store_error)?;
+
+    // Always return committed, stored response bytes.
+    // This also covers idempotent replays.
+    Ok(json_response(reversed.response_body, StatusCode::CREATED))
 }
 
 #[utoipa::path(

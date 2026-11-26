@@ -53,6 +53,18 @@ async fn application_role_cannot_access_accounting_tables() {
         "UPDATE ledger.account_balances SET debit_total = 1",
         "DELETE FROM ledger.transactions",
         "TRUNCATE ledger.entries",
+        "SELECT * FROM ledger.execute_posting(
+            NULL::uuid,
+            NULL::uuid,
+            NULL::text,
+            NULL::text,
+            NULL::bytea,
+            NULL::bytea,
+            NULL::timestamptz,
+            NULL::jsonb,
+            NULL::uuid,
+            FALSE
+        )",
         "SELECT ledger.close_period(
             '00000000-0000-0000-0000-000000000000'::uuid,
             NOW()
@@ -200,5 +212,35 @@ async fn security_objects_have_trusted_ownership() {
         assert!(!is_superuser, "{role} must not be superuser");
         assert!(!can_login, "{role} must not be a login role");
         assert!(!bypasses_rls, "{role} must not bypass RLS");
+    }
+}
+
+#[tokio::test]
+async fn runtime_roles_cannot_access_legacy_storage() {
+    let db = common::TestDb::new().await;
+
+    let forbidden_statements = [
+        "SELECT COUNT(*) FROM public.accounts",
+        "SELECT COUNT(*) FROM public.transactions",
+        "SELECT COUNT(*) FROM public.entries",
+        "SELECT COUNT(*) FROM public.balances",
+        "INSERT INTO public.accounts DEFAULT VALUES",
+        "INSERT INTO public.transactions DEFAULT VALUES",
+        "INSERT INTO public.entries DEFAULT VALUES",
+        "UPDATE public.balances SET balance = 0",
+        "DELETE FROM public.transactions",
+        "TRUNCATE public.entries",
+        "CREATE TABLE public.unauthorized_table (id INTEGER)",
+        "CREATE TABLE ledger.unauthorized_table (id INTEGER)",
+    ];
+
+    for role in ["ledger_app", "ledger_admin", "ledger_readonly"] {
+        for statement in forbidden_statements {
+            let error = execute_as_role(&db.pool, role, statement)
+                .await
+                .expect_err("Protected legacy storage must not be accessible");
+
+            assert_permission_denied(error);
+        }
     }
 }

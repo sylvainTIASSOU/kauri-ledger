@@ -63,6 +63,29 @@ impl BalancedTransaction {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+
+    /// Create an exact compensating transaction.
+    ///
+    /// The original entries remain unchanged. Acount identity,
+    /// amount and entry order are preserved; only the direction
+    /// of each entry is inverted.
+    ///
+    /// The resulting transaction is validated again against all domain invariants.
+    pub fn reversed(&self) -> Result<Self, LedgerError> {
+        let reversed_entry = self
+            .entries()
+            .iter()
+            .map(|entry| {
+                let direction = match entry.direction {
+                    Direction::Debit => Direction::Credit,
+                    Direction::Credit => Direction::Debit,
+                };
+                Entry::new(entry.account_code.clone(), direction, entry.amount)
+            })
+            .collect();
+
+        Self::new(reversed_entry)
+    }
 }
 
 #[derive(Deserialize)]

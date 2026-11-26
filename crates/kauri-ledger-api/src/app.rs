@@ -53,6 +53,10 @@ pub fn build_router_with_ledger(state: LedgerApiState) -> Router {
             post(crate::controllers::ledger::post_transaction),
         )
         .route(
+            "/v1/ledgers/{ledger_id}/transactions/{transaction_id}/reverse",
+            post(crate::controllers::ledger::reverse_transaction),
+        )
+        .route(
             "/v1/ledgers/{ledger_id}/accounts/{code}/balance",
             get(crate::controllers::ledger::account_balance),
         )

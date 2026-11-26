@@ -8,6 +8,7 @@ pub mod idempotency;
 pub mod integrity;
 pub mod models;
 pub mod repository;
+pub mod reversal_repository;
 pub mod tenant_repository;
 
 pub use db::{create_pool, run_migrations};

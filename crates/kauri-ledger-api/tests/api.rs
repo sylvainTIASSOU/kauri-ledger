@@ -117,6 +117,11 @@ async fn openapi_document_contains_the_application_endpoints() {
         &body["paths"]["/v1/ledgers/{ledger_id}/transactions"]["post"]["security"];
 
     assert_eq!(posting_security[0]["bearer_auth"], serde_json::json!([]));
+
+    assert!(
+        body["paths"]["/v1/ledgers/{ledger_id}/transactions/{transaction_id}/reverse"]["post"]
+            .is_object()
+    );
 }
 
 #[tokio::test]
