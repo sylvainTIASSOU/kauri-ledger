@@ -1,6 +1,5 @@
-
+cargo fmt --all
 cargo generate-lockfile
-cargo fmt
 cargo fmt --all -- --check
 cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features

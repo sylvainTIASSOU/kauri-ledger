@@ -1,3 +1,6 @@
+-- Enable pgcrypto extension for gen_random_uuid() compatibility across PostgreSQL versions
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 -- Create transactions table
 CREATE TABLE IF NOT EXISTS transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

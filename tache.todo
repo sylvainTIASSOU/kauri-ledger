@@ -1,0 +1,49 @@
+// TODO: ===============================================================================================================
+3. Attention à un problème plus important dans ton Ledger
+Ta fonction actuelle présente un risque pour l'idempotence.
+
+Tu concatènes les valeurs sans indiquer leur longueur :
+hasher.update(entry.account_code.as_str().as_bytes());
+
+
+Cela peut provoquer des ambiguïtés entre des champs différents.
+
+Par exemple, ces deux séquences produisent les mêmes octets :
+["ab", "c"]  → "abc"
+["a", "bc"]  → "abc"
+
+
+Pour éviter cette ambiguïté, encode explicitement la longueur des champs variables.
+***************************************************************************
+use sha2::{Digest, Sha256};
+
+fn compute_payload_hash(tx: &BalancedTransaction) -> String {
+    let mut hasher = Sha256::new();
+
+    hasher.update(b"kauri-ledger:entries:v1");
+
+    // Include the number of entries
+    hasher.update((tx.entries().len() as u64).to_be_bytes());
+
+    for entry in tx.entries() {
+        let account_code = entry.account_code.as_str().as_bytes();
+
+        // Length-prefixed account code
+        hasher.update((account_code.len() as u64).to_be_bytes());
+        hasher.update(account_code);
+
+        // Direction
+        let direction: u8 = match entry.direction {
+            Direction::Debit => 0,
+            Direction::Credit => 1,
+        };
+
+        hasher.update([direction]);
+
+        // Amount
+        hasher.update(entry.amount.as_i64().to_be_bytes());
+    }
+
+    hex::encode(hasher.finalize())
+}
+===============================================================================================================

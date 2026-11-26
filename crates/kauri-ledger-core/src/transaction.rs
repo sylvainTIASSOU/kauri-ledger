@@ -1,11 +1,17 @@
 use crate::amount::Amount;
 use crate::entry::{Direction, Entry};
 use crate::error::LedgerError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+
+/// Maximum amount alloawed for a single ledger entry.
+pub const MAX_ENTRY_AMOUNT: i64 = 1_000_000_000_000;
+
+/// Maximum number of entries allowed in a transaction.
+pub const MAX_TRANSACTION_ENTRIES: usize = 64;
 
 /// A transaction that is guaranteed to be balanced upon creation.
 /// It is immutable and cannot be constructed if the invariants are violated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BalancedTransaction {
     entries: Vec<Entry>,
 }
@@ -22,12 +28,20 @@ impl BalancedTransaction {
             return Err(LedgerError::InsufficientEntries);
         }
 
+        if entries.len() > MAX_TRANSACTION_ENTRIES {
+            return Err(LedgerError::TooManyEntries);
+        }
+
         let mut total_debits = Amount::default();
         let mut total_credits = Amount::default();
 
         for entry in &entries {
             if entry.amount.is_zero() {
                 return Err(LedgerError::InvalidAmount);
+            }
+
+            if entry.amount.as_i64() > MAX_ENTRY_AMOUNT {
+                return Err(LedgerError::EntryAmountTooLarge);
             }
 
             match entry.direction {
@@ -48,6 +62,46 @@ impl BalancedTransaction {
     /// Returns a reference to the entries.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Create an exact compensating transaction.
+    ///
+    /// The original entries remain unchanged. Acount identity,
+    /// amount and entry order are preserved; only the direction
+    /// of each entry is inverted.
+    ///
+    /// The resulting transaction is validated again against all domain invariants.
+    pub fn reversed(&self) -> Result<Self, LedgerError> {
+        let reversed_entry = self
+            .entries()
+            .iter()
+            .map(|entry| {
+                let direction = match entry.direction {
+                    Direction::Debit => Direction::Credit,
+                    Direction::Credit => Direction::Debit,
+                };
+                Entry::new(entry.account_code.clone(), direction, entry.amount)
+            })
+            .collect();
+
+        Self::new(reversed_entry)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnvalidatedTransaction {
+    entries: Vec<Entry>,
+}
+
+impl<'de> Deserialize<'de> for BalancedTransaction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = UnvalidatedTransaction::deserialize(deserializer)?;
+
+        Self::new(raw.entries).map_err(D::Error::custom)
     }
 }
 
@@ -72,7 +126,7 @@ mod tests {
 
             let tx = BalancedTransaction::new(entries).unwrap();
 
-            let deltas = calculate_balance_delta(&tx);
+            let deltas = calculate_balance_delta(&tx).unwrap();
             let sum: i64 = deltas.values().sum();
 
             // The sum of all deltas in a balanced transaction must be exactly 0.
@@ -153,8 +207,8 @@ mod tests {
         let reversed_tx = BalancedTransaction::new(reversed_entries).unwrap();
 
         // Calculate deltas
-        let delta1 = calculate_balance_delta(&tx);
-        let delta2 = calculate_balance_delta(&reversed_tx);
+        let delta1 = calculate_balance_delta(&tx).unwrap();
+        let delta2 = calculate_balance_delta(&reversed_tx).unwrap();
 
         // Sum of deltas should be zero for all accounts
         let mut combined = delta1;
